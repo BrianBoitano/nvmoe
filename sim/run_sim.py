@@ -37,6 +37,14 @@ def ceiling_toks(model: ModelPreset, hw: HardwarePreset, hit_rate: float) -> tup
 def report(model_key: str, args: argparse.Namespace) -> None:
     model = MODELS[model_key]
     hw = HARDWARE[args.hardware]
+    # let anyone model THEIR box without editing presets
+    if args.vram_gb or args.nvme_gbps:
+        hw = HardwarePreset(
+            name=f"custom ({args.vram_gb or hw.vram_gb:.0f}GB VRAM, "
+                 f"{args.nvme_gbps or hw.nvme_gbps:.1f}GB/s NVMe)",
+            vram_gb=args.vram_gb or hw.vram_gb,
+            nvme_gbps=args.nvme_gbps or hw.nvme_gbps,
+        )
 
     budget = cache_budget_gb(model, hw)
     capacity = int(budget * 1e9 / model.expert_bytes)
@@ -81,6 +89,9 @@ def main() -> None:
     parser.add_argument("--model", choices=sorted(MODELS), help="model preset")
     parser.add_argument("--all", action="store_true", help="run every preset")
     parser.add_argument("--hardware", default="5070ti-990pro", choices=sorted(HARDWARE))
+    parser.add_argument("--vram-gb", type=float, help="override: your GPU's VRAM in GB")
+    parser.add_argument("--nvme-gbps", type=float,
+                        help="override: your SSD's read bandwidth in GB/s (measure with tools/nvme_probe.py)")
     parser.add_argument("--trace", help="real routing trace (JSONL) instead of synthetic")
     parser.add_argument("--tokens", type=int, default=2000)
     parser.add_argument("--zipf-s", type=float, default=1.0)

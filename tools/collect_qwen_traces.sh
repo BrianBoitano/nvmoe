@@ -1,10 +1,26 @@
 #!/bin/bash
 # Collect Qwen3-30B-A3B routing traces across four workloads, post-process,
-# and print stats. Run from the nvmoe repo root.
+# and print stats. Run from the nvmoe repo root:
+#
+#   BIN=/path/to/llama.cpp/build/bin/llama-nvmoe-trace \
+#   MODEL=/path/to/Qwen3-30B-A3B-Q4_K_M.gguf \
+#   bash tools/collect_qwen_traces.sh
+#
+# BIN is the collector binary built by collector/install.sh.
+# Works with any MoE GGUF — smaller models (OLMoE, Qwen3-30B-A3B,
+# DeepSeek-V2-Lite) trace fine on CPU; no GPU required.
 set -e
-BIN=${BIN:-/workspace/projects/llama.cpp-nvmoe/build/bin/llama-nvmoe-trace}
-MODEL=${MODEL:-models/qwen3-30b-a3b-q4_k_m.gguf}
+BIN=${BIN:-llama-nvmoe-trace}
+MODEL=${MODEL:?set MODEL=/path/to/model.gguf}
 
+command -v "$BIN" >/dev/null || [ -x "$BIN" ] || {
+    echo "collector binary not found: $BIN"
+    echo "build it with: ./collector/install.sh /path/to/llama.cpp"
+    exit 1
+}
+[ -f "$MODEL" ] || { echo "model not found: $MODEL"; exit 1; }
+
+mkdir -p traces
 for w in chat code story summarize; do
     n=400
     [ "$w" = summarize ] && n=200
