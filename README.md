@@ -6,7 +6,7 @@ Modern flagship open-weight models (DeepSeek-R1 671B, Qwen3-Next-80B, GPT-OSS-12
 
 ## Who is this for
 
-- **You have a 8-24GB GPU and want to run models that don't fit.** Measured, not simulated: Qwen3-30B-A3B (18.6GB, doesn't fit a 16GB card) decodes at **166 tok/s** from its NVMe pack — 2.1x the best llama.cpp offload split — using 756MB of host RAM ([tables](runtime/README.md)).
+- **You have a 8-24GB GPU and want to run models that don't fit.** Measured, not simulated: Qwen3-30B-A3B (18.6GB, doesn't fit a 16GB card) decodes at **166 tok/s** from its NVMe pack — 2.1x the best llama.cpp offload split — using 756MB of host RAM. **GPT-OSS-120B (63GB) decodes at 24.5 tok/s** on the same card, ~3x the best stock configuration this box can attempt, inside a 4GB memory cgroup ([tables](runtime/README.md)).
 - **You want the big ones.** DeepSeek-R1 671B (dynamic 1.58-bit, 131GB on disk) pencils out to ~2 tok/s on a 16GB card + consumer SSD. Slow, but it *runs*, on hardware that costs less than the RAM other approaches require.
 - **Your RAM is spoken for.** Every existing offload system (KTransformers, Fiddler, llama.cpp's `exps=CPU`) parks expert weights in system RAM. If your machine runs a Docker stack, a game, or VMs, that RAM isn't free. nvmoe bypasses the page cache entirely (O_DIRECT) and caps host memory use.
 
@@ -103,6 +103,8 @@ works is in [docs/INTEGRATION.md](docs/INTEGRATION.md).
 
 **The runtime works, end to end.** Qwen3-30B-A3B Q4_K_M (18.6GB GGUF, does not fit in 16GB VRAM) decodes at **166.1 ± 2.2 tok/s** from its pack with a 12GB VRAM expert cache and synchronous fetch-on-miss — vs 79.2 for stock llama.cpp's best partial offload and 45.2 for the experts-in-RAM recipe (which needs ~17GB of free host RAM; nvmoe used **756MB peak, measured inside a hard 4GB cgroup**). Cache-budget sweep, prefill caveat, and every command: [runtime/README.md](runtime/README.md). Correctness bar: **bit-identical logits vs stock**, CPU and CUDA, including under heavy cache eviction.
 
+**It scales to models 4x the card.** GPT-OSS-120B (MXFP4, 63GB GGUF, 5.1B active) decodes at **24.5 ± 3.3 tok/s** with an 11GB VRAM expert cache — 2.2x the simulator's conservative ceiling and ~3x the best stock configuration this 64GB-RAM box can attempt (`exps=CPU` manages 8.3 ± 4.0 while monopolizing ~57GB of page cache; nvmoe's whole decode ran inside a **hard 4GB cgroup at full speed**, 3.1GB peak). The pack: 4,608 extents of 12.6MB, 96.1% of the file paged, byte-identical repack in 68s, logits gate passed.
+
 **NVMe delivers.** Samsung 990 PRO (PCIe 4.0 x4), O_DIRECT random reads at expert-sized blocks: 4.4 GB/s at 2MB/QD1 rising to ~6-7 GB/s at 9MB+, ~8 GB/s at 2MB/QD4. Expert-granular random access costs almost nothing vs sequential.
 
 **A cache miss costs ~0.7ms — disk all the way into VRAM.** io_uring + O_DIRECT random extent fetches from real repacked expert packs (`paging/nvmoe-iobench`), measured both into host RAM and end-to-end into a VRAM slab (`--gpu`: pinned staging + `cudaMemcpyHtoDAsync`, byte-verified): p50 0.7ms / p99 ~1ms per expert at QD1, peaking at **~7 GB/s and ~2,300 experts/s at QD2**, with the GPU hop costing only 2-5% (PCIe hides behind the NVMe reads — the SSD stays the bottleneck, as designed). ~220MB of pinned host RAM sustained the peak: the ≤4GB budget has 10x headroom. One surprise: throughput *falls* past QD4 (multi-MB reads are already parallel inside the SSD), so the prefetcher design keeps 2-4 reads in flight, not the 16-32 first guessed. Details + full tables: [paging/README.md](paging/README.md).
@@ -125,7 +127,7 @@ Top-10% of experts carry 34.7% of routing traffic; consecutive tokens reuse 43.4
 | Model | Experts on NVMe | Cache budget | Ceiling |
 |---|---|---|---|
 | Qwen3-Next-80B-A3B (4.5-bit) | 43GB | 12.5GB (29% of experts) | **~66 tok/s** |
-| GPT-OSS-120B (MXFP4) | 61GB | 12.0GB (20%) | **~11 tok/s** |
+| GPT-OSS-120B (MXFP4) | 61GB | 12.0GB (20%) | ~11 tok/s — **measured: 24.5** (real routing caches far better than the synthetic model) |
 | Mixtral-8x7B (4.5-bit) | 25GB | 13.5GB (53%) | 3.5 tok/s |
 | DeepSeek-R1 671B (dyn 1.58-bit) | 129GB | 5.5GB (4.3%) | **~2.4 tok/s** |
 
@@ -145,7 +147,8 @@ Prefill is the known weak spot: a long prompt touches nearly every expert (~18s 
   - [x] **2.3b GPU path**: pools live on the layer's device (VRAM under `-ngl`, split per device on partial offload), fetches DMA through a pinned bounce — pure ggml-backend API, no CUDA code in the runtime; **bit-identical logits on the CUDA backend** (full offload, heavy VRAM eviction, and mixed CPU+GPU pools)
   - [x] **2.3c(i) overlapped miss fetches**: an op's batched misses fetch at QD 2-4 (the measured optimum) — +25% decode at a 4GB cache, logits still bit-identical
   - [x] **2.3c(ii) router-logit lookahead prefetch**: predict layer L+1's experts from layer L's hidden state (one folded matmul per layer — **~86% of routed ids at top-8**, measured) and fetch them during L's compute via a priority fetch pool; +4-7% decode at fetch-bound budgets, auto-off near-resident, still bit-identical. The offline-table alternative was evaluated against real traces and rejected (`tools/analyze_lookahead.py`)
-  - [x] **2.4 measured tok/s on Qwen3-30B-A3B** ([tables + commands](runtime/README.md)): **166 tok/s decode from the pack at a 12GB VRAM cache — 2.1x the best stock offload split, 3.7x the exps-in-RAM recipe — with 756MB peak host RAM, proven inside a hard 4GB cgroup.** Open: GPT-OSS-120B (~61GB download)
+  - [x] **2.4 measured tok/s on Qwen3-30B-A3B** ([tables + commands](runtime/README.md)): **166 tok/s decode from the pack at a 12GB VRAM cache — 2.1x the best stock offload split, 3.7x the exps-in-RAM recipe — with 756MB peak host RAM, proven inside a hard 4GB cgroup.**
+  - [x] **2.4b GPT-OSS-120B** ([tables + commands](runtime/README.md)): a 63GB model on the 16GB card — **24.5 tok/s decode at an 11GB cache, ~3x the best stock attempt, inside a 4GB cgroup**; the sweep (10.5/18.7/24.5 at 4/8/11GB) tracks the hit-rate curves, and its 12.6MB extents produced the extent-size speculation gate (wasted prefetch guesses cost more than they hide on fetch-bound decode)
 - [ ] **Phase 3 — planner**: probe hardware, read GGUF metadata, emit the optimal quant + placement plan per model automatically
 - [ ] **Stunt flag**: DeepSeek-R1 671B, 16GB VRAM, ≤4GB RAM, on video
 

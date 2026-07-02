@@ -149,10 +149,17 @@ from the real router; prefetch only warms slots).
 What was tried and measured *slower* on the reference box, kept behind
 envs: top-16 prediction (`NVMOE_LOOKAHEAD=16`, ~2x wasted bytes on an
 I/O-bound pipeline) and a two-layer horizon (`NVMOE_LOOKAHEAD_DEPTH=2`,
-compounding error + speculative evictions). Lookahead auto-disables when
-the cache holds >60% of the paged experts — at near-resident budgets the
-48 extra matmul launches cost ~4% and there is almost nothing to hide.
-`NVMOE_PREFETCH=0` computes predictions and stats without speculative I/O.
+compounding error + speculative evictions). GPT-OSS-120B added the
+sharpest lesson: with 12.6MB extents an 82%-accurate predictor still lost
+11% throughput — decode there is ~97% SSD-time, so there is no idle
+bandwidth to hide waste in and every wrong guess is pure loss. Hence the
+**extent-size gate**: layers whose extents exceed 6MB don't speculate
+(`NVMOE_PREFETCH=1` forces it, e.g. on a faster SSD), and when no layer
+qualifies the lookahead graph work is dropped entirely. Lookahead also
+auto-disables when the cache holds >60% of the paged experts — at
+near-resident budgets the 48 extra matmul launches cost ~4% and there is
+almost nothing to hide. `NVMOE_PREFETCH=0` computes predictions and stats
+without speculative I/O.
 
 ## Constraints inherited by later stages
 

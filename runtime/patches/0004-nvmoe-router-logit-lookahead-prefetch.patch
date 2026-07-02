@@ -43,10 +43,10 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 ---
  src/llama-context.cpp |   6 +
  src/llama-graph.cpp   |  18 +-
- src/llama-model.cpp   |  14 ++
- src/llama-nvmoe.cpp   | 564 +++++++++++++++++++++++++++++++++++++++---
- src/llama-nvmoe.h     |  83 ++++++-
- 5 files changed, 643 insertions(+), 42 deletions(-)
+ src/llama-model.cpp   |  14 +
+ src/llama-nvmoe.cpp   | 582 +++++++++++++++++++++++++++++++++++++++---
+ src/llama-nvmoe.h     |  89 ++++++-
+ 5 files changed, 667 insertions(+), 42 deletions(-)
 
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
 index c2beca8..584b874 100644
@@ -120,7 +120,7 @@ index f5b4268..f1372ab 100644
  
      return true;
 diff --git a/src/llama-nvmoe.cpp b/src/llama-nvmoe.cpp
-index 2ccfaef..68dfaa2 100644
+index 2ccfaef..037eafb 100644
 --- a/src/llama-nvmoe.cpp
 +++ b/src/llama-nvmoe.cpp
 @@ -26,11 +26,40 @@ static const char * llama_nvmoe_kind_names[LLAMA_NVMOE_KIND_COUNT] = {
@@ -179,7 +179,7 @@ index 2ccfaef..68dfaa2 100644
          g.buft = s.buft;
      }
  
-@@ -322,6 +353,230 @@ llama_nvmoe_context * llama_nvmoe_init(const std::string & pack_dir, const std::
+@@ -322,6 +353,248 @@ llama_nvmoe_context * llama_nvmoe_init(const std::string & pack_dir, const std::
      return ctx.release();
  }
  
@@ -258,6 +258,24 @@ index 2ccfaef..68dfaa2 100644
 +    }
 +    if (const char * s = getenv("NVMOE_PREFETCH")) {
 +        nc->prefetch = atoi(s) != 0;
++        if (nc->prefetch) {
++            nc->spec_stride_max = SIZE_MAX; // forced: speculate at any extent size
++        }
++    }
++    // if no layer's extents are small enough to speculate on, the lookahead
++    // graph work would be pure overhead — drop it entirely
++    if (nc->lk_top > 0 && nc->prefetch && getenv("NVMOE_PREFETCH") == nullptr) {
++        bool any = false;
++        for (auto & lyr : nc->layers) {
++            if (lyr && lyr->group_stride <= nc->spec_stride_max) {
++                any = true;
++                break;
++            }
++        }
++        if (!any) {
++            nc->lk_top = 0;
++            LLAMA_LOG_INFO("nvmoe: lookahead off (extents too large to speculate on profitably; NVMOE_PREFETCH=1 forces it)\n");
++        }
 +    }
 +    if (nc->lk_top == 0) {
 +        return; // legacy synchronous path, none of the pool machinery runs
@@ -410,7 +428,7 @@ index 2ccfaef..68dfaa2 100644
  llama_nvmoe_layer * llama_nvmoe_get_layer(const llama_nvmoe_context * ctx, int il) {
      if (il < 0 || (size_t) il >= ctx->layers.size()) {
          return nullptr;
-@@ -362,28 +617,41 @@ static void llama_nvmoe_fetch(llama_nvmoe_layer * lyr, int32_t expert, int32_t s
+@@ -362,28 +635,41 @@ static void llama_nvmoe_fetch(llama_nvmoe_layer * lyr, int32_t expert, int32_t s
      }
  }
  
@@ -471,7 +489,7 @@ index 2ccfaef..68dfaa2 100644
  
      const int64_t n = ggml_nelements(a);
      const int32_t * ids = (const int32_t *) a->data;
-@@ -404,25 +672,11 @@ static void llama_nvmoe_fetch_op(ggml_tensor * dst, const ggml_tensor * a, int i
+@@ -404,25 +690,11 @@ static void llama_nvmoe_fetch_op(ggml_tensor * dst, const ggml_tensor * a, int i
          } else {
              nc->n_miss++;
  
@@ -499,7 +517,7 @@ index 2ccfaef..68dfaa2 100644
  
              g.slot_key[slot] = key;
              g.where[key]     = slot;
-@@ -464,10 +718,242 @@ static void llama_nvmoe_fetch_op(ggml_tensor * dst, const ggml_tensor * a, int i
+@@ -464,10 +736,242 @@ static void llama_nvmoe_fetch_op(ggml_tensor * dst, const ggml_tensor * a, int i
      nc->n_bytes    += misses.size() * lyr->group_stride;
  }
  
@@ -616,7 +634,7 @@ index 2ccfaef..68dfaa2 100644
 +
 +        nl->pred[k] = pred_ids;
 +
-+        if (nc->prefetch) {
++        if (nc->prefetch && nl->group_stride <= nc->spec_stride_max) {
 +            for (const int32_t e : pred_ids) {
 +                const int64_t key = ((int64_t) nl->il << 32) | (uint32_t) e;
 +                if (ng.where.count(key)) {
@@ -744,7 +762,7 @@ index 2ccfaef..68dfaa2 100644
      return ggml_map_custom1(ctx0, selected_experts, llama_nvmoe_fetch_op, 1, lyr);
  }
 diff --git a/src/llama-nvmoe.h b/src/llama-nvmoe.h
-index e9478ed..68c8049 100644
+index e9478ed..27b151f 100644
 --- a/src/llama-nvmoe.h
 +++ b/src/llama-nvmoe.h
 @@ -22,9 +22,13 @@
@@ -793,7 +811,7 @@ index e9478ed..68c8049 100644
      std::unordered_map<int64_t, int32_t> where;
  };
  
-@@ -111,12 +133,48 @@ struct llama_nvmoe_context {
+@@ -111,12 +133,54 @@ struct llama_nvmoe_context {
      uint64_t tick  = 0; // LRU clock
      uint64_t epoch = 0; // custom-op invocation counter (for per-op pinning)
  
@@ -803,6 +821,12 @@ index e9478ed..68c8049 100644
 +    int  lk_top   = 0;    // predicted ids per token (NVMOE_LOOKAHEAD, 0 = off)
 +    int  lk_depth = 1;    // prefetch horizon in layers, 1-2 (NVMOE_LOOKAHEAD_DEPTH)
 +    bool prefetch = true; // issue speculative fetches (NVMOE_PREFETCH=0: stats only)
++    // speculation is only worth it when a wasted guess is cheap: measured on
++    // the reference SSD, 2.7-3.4MB extents gain 4-7% while 12.6MB extents
++    // LOSE 11% (fetch-bound decode has no idle SSD time to hide waste in).
++    // Layers with extents over this stride don't speculate; NVMOE_PREFETCH=1
++    // forces speculation for every layer.
++    size_t spec_stride_max = 6u << 20;
 +
 +    std::vector<ggml_context_ptr>        ctx_lk;
 +    std::vector<ggml_backend_buffer_ptr> buf_lk;
@@ -842,7 +866,7 @@ index e9478ed..68c8049 100644
      ~llama_nvmoe_context();
  };
  
-@@ -126,11 +184,32 @@ struct llama_nvmoe_context {
+@@ -126,11 +190,32 @@ struct llama_nvmoe_context {
  llama_nvmoe_context * llama_nvmoe_init(const std::string & pack_dir, const std::string & manifest_name, int64_t cache_bytes,
          const std::vector<ggml_backend_dev_t> & layer_dev);
  

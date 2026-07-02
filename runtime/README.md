@@ -44,13 +44,18 @@ on.
 Two variants measured slower and are off by default, kept as env knobs:
 top-16 prediction (`NVMOE_LOOKAHEAD=16`) and a two-layer horizon
 (`NVMOE_LOOKAHEAD_DEPTH=2`) — on an I/O-bound pipeline the wasted extents
-cost more than the extra hidden misses. Lookahead also auto-disables when
-the cache holds over 60% of the paged experts (its per-layer kernel
-launches, with CUDA graphs already off, outweigh the rare hidden miss);
-`NVMOE_LOOKAHEAD=8` forces it on, `NVMOE_LOOKAHEAD=0` off, and
-`NVMOE_PREFETCH=0` keeps the prediction statistics without speculative
-I/O. The stats print at model teardown (visible via `llama-nvmoe-logits`;
-`llama-bench` silences model logs).
+cost more than the extra hidden misses. For the same reason speculation is
+gated by **extent size**: at GPT-OSS-120B's 12.6MB extents an 82%-accurate
+predictor still *lost* 11% throughput (decode there is ~97% SSD-time — no
+idle bandwidth to hide waste in), so layers with extents over 6MB don't
+speculate by default. Lookahead also auto-disables when the cache holds
+over 60% of the paged experts (its per-layer kernel launches, with CUDA
+graphs already off, outweigh the rare hidden miss). `NVMOE_LOOKAHEAD=8`
+forces lookahead on, `NVMOE_LOOKAHEAD=0` off; `NVMOE_PREFETCH=1` forces
+speculation at any extent size (try it on a faster SSD), `NVMOE_PREFETCH=0`
+keeps the prediction statistics without speculative I/O. The stats print
+at model teardown (visible via `llama-nvmoe-logits`; `llama-bench`
+silences model logs).
 
 Rationale with data: the same-ids and offline-correlation predictors were
 evaluated against the Phase 1 traces first and rejected —
@@ -82,6 +87,7 @@ CUDA 12.8, `-ngl` as shown; "prefetch" = lookahead prefetch active):
 | CPU | OLMoE-1B-7B Q4_0 | 48, second prompt | all resident | BIT-IDENTICAL |
 | CPU | Qwen3-30B-A3B Q4_K_M | 24 | all resident (2 pool groups, mixed Q4_K/Q6_K) | BIT-IDENTICAL |
 | CPU | Qwen3-30B-A3B Q4_K_M | 16 | 4GB + prefetch (eviction, 2 pool groups) | BIT-IDENTICAL |
+| CPU | GPT-OSS-120B MXFP4 | 12 | 8GB (63GB model, eviction) | BIT-IDENTICAL |
 | CUDA `-ngl 99` | OLMoE-1B-7B Q4_0 | 32 | all resident in VRAM | BIT-IDENTICAL |
 | CUDA `-ngl 99` | OLMoE-1B-7B Q4_0 | 32 | 512MB VRAM (heavy eviction) | BIT-IDENTICAL |
 | CUDA `-ngl 99` | OLMoE-1B-7B Q4_0 | 32 | 512MB VRAM + prefetch | BIT-IDENTICAL |
@@ -152,6 +158,44 @@ Lookahead is worth ~4-7% where fetches dominate and costs ~4% where they
 don't (the 12288 row) — hence the auto-off. The sync columns are the
 same binary with `NVMOE_LOOKAHEAD=0`, measured back-to-back; the large
 ± at 8192 is the cold first rep, common to both columns.
+
+## GPT-OSS-120B — a 63GB model on the 16GB card (Phase 2.4b)
+
+Same box, same procedure, a model **4x the VRAM**: GPT-OSS-120B MXFP4
+(63.4GB GGUF; 36 layers × 128 experts, top-4; 5.1B active params). The
+three HF splits merge with `llama-gguf-split --merge`; the repacker then
+produces 4,608 extents of 12.6MB (96.1% of the file paged, 2.3GB resident)
+in 68s, `verify_pack.py` proves every byte, and the logits gate passes:
+**bit-identical vs stock over 12 greedy steps** (201k logits/step, CPU,
+8GB cache — the all-resident pools wouldn't fit in RAM, which is the
+point).
+
+| config | tg64 (decode) |
+|---|---|
+| **nvmoe pack, 11GB VRAM cache** | **24.5 ± 3.3** |
+| nvmoe pack, 8GB | 18.7 ± 1.0 |
+| nvmoe pack, 4GB | 10.5 ± 0.5 |
+| stock, experts in RAM (`-ot ...exps=CPU -ngl 99`) | 8.3 ± 4.0 — and it monopolizes ~57GB of page cache |
+| stock, best partial offload that fits (`-ngl 7`) | 6.6 ± 3.5 |
+| stock, full VRAM | *does not fit, at all* |
+
+```bash
+./build-cuda/bin/llama-gguf-split --merge gpt-oss-120b-mxfp4-00001-of-00003.gguf gpt-oss-120b-mxfp4.gguf
+python3 tools/repack_gguf.py models/gpt-oss-120b-mxfp4.gguf
+python3 tools/verify_pack.py models/gpt-oss-120b-mxfp4.nvmoe models/gpt-oss-120b-mxfp4.gguf
+NVMOE_CACHE_MB=11264 ./build-cuda/bin/llama-bench \
+    -m models/gpt-oss-120b-mxfp4.nvmoe/resident.gguf -ngl 99 -p 0 -n 64 -r 3 -t 8
+```
+
+Prefill at the 11GB cache: pp512 = 98.6 ± 0.03 (a long prompt sweeps most
+of the 57GB of experts through the cache — decode-optimized by design).
+The simulator's ceiling for this model was ~11 tok/s; reality is 2.2x
+that, because real routing is far more cacheable than the synthetic
+traces assumed (the same direction Phase 1 measured on Qwen3). And the
+RAM story holds at 120B scale: the whole decode ran inside a
+`--memory=4g` cgroup at full speed (24.5 → 23.3 within noise), peak
+3.1GB — most of which is the one-time 2.3GB resident-weight load
+streaming through page cache.
 
 ## The host-RAM proof (Phase 2 headline)
 
