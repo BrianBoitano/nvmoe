@@ -32,9 +32,9 @@ The tok/s model and its calibration:
 Honesty note, verified by --postdict: this predicts REAL-WORKLOAD decode.
 llama-bench's `-p 0` decode (generation from BOS, short horizon) routes far
 more repetitively than real prompts and can land up to ~2x ABOVE the
-prediction on flat-routing (DeepSeek-family) models; on skewed-routing
-models (Qwen-family) it lands within ~±25%. The planner's range reflects
-that spread.
+prediction on flat-routing (DeepSeek-family) models and at small caches
+on fine-grained-expert models; on skewed-routing models near-resident it
+lands within ~±25%. The planner's range reflects that spread.
 """
 
 import argparse
@@ -59,7 +59,7 @@ GPU_EFF_GBPS = 420.0        # see module docstring
 REFERENCE_NVME_GBPS = 7.0   # the SSD the nvme_eff anchors were measured on
 PACK_OVERHEAD_WHEN_FITS = 0.13   # measured: V2-Lite pack-resident vs stock
 DEFAULT_HEADROOM_GB = 1.5   # compute buffers + fragmentation, ballpark
-PRED_RANGE = (0.9, 2.1)     # measured/predicted spread over the 8 anchors
+PRED_RANGE = (0.7, 2.5)     # measured/predicted spread over the 11 anchors
 
 # routing family -> committed real trace (all: 4 workloads, 1396 decode
 # tokens). Curves transfer between models as hit(cache fraction of total
@@ -76,6 +76,7 @@ FAMILIES = {
 }
 ARCH_FAMILY = {
     "qwen3moe": "qwen3", "qwen2moe": "qwen3", "olmoe": "qwen3",
+    "qwen3next": "qwen3",
     "gpt-oss": "gptoss",
     "deepseek2": "deepseek", "deepseek3": "deepseek",
     # sim/presets.py keys, for --preset plans of models not on disk
@@ -367,6 +368,12 @@ POSTDICT = [
      Geometry("gpt-oss-120b-mxfp4.gguf", "gpt-oss", 36, 128, 4,
               [(13221888, 36)], int(2.47e9), 1.5),
      [(11264, 24.5), (8192, 18.7), (4096, 10.5)]),
+    # sync-fetch (NVMOE_LOOKAHEAD=0) rows of the qwen3-next sweep — the
+    # prediction models synchronous misses; prefetch added +12-17% on top
+    ("qwen3-next-80b-a3b-q4_k_m", "qwen3",
+     Geometry("qwen3-next-80b-a3b-instruct-q4_k_m.gguf", "qwen3next", 48, 512, 10,
+              [(1769472, 24), (2039808, 24)], int(1.70e9), 0.4),
+     [(11776, 35.4), (8192, 27.3), (4096, 18.0)]),
     ("deepseek-v2-lite-chat-q4_k_m", "deepseek",
      Geometry("deepseek-v2-lite-chat-q4_k_m.gguf", "deepseek2", 26, 64, 6,
               [(5226496, 14), (6307840, 12)], int(0.84e9), 0.5),

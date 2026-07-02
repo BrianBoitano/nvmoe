@@ -93,16 +93,23 @@ CUDA 12.8, `-ngl` as shown; "prefetch" = lookahead prefetch active):
 | CUDA `-ngl 99` | OLMoE-1B-7B Q4_0 | 32 | 512MB VRAM (heavy eviction) | BIT-IDENTICAL |
 | CUDA `-ngl 99` | OLMoE-1B-7B Q4_0 | 32 | 512MB VRAM + prefetch | BIT-IDENTICAL |
 | CUDA `-ngl 8` | OLMoE-1B-7B Q4_0 | 32 | pools split CPU + VRAM (+ prefetch) | BIT-IDENTICAL |
+| CPU | Qwen3-Next-80B Q4_K_M | 16 | 8GB + prefetch (hybrid attention, shared expert) | BIT-IDENTICAL |
+| CUDA `-ngl 14` | Qwen3-Next-80B Q4_K_M | 16 | 8GB, pools split CPU + VRAM | BIT-IDENTICAL |
 
 Prefetch cannot change the math — it only warms cache slots; the ids the
 matmuls consume always come from the real router — but the eviction /
 in-flight / remap interplay is exactly where a bug would hide, so the gate
 runs with it on.
 
-The gate tool disables CPU weight repacking (`use_extra_bufts = false`):
-the repacked interleaved kernels sum in a different order than the plain
-kernels the pool tensors use, which is a kernel-choice difference, not a
-data difference — see docs/INTEGRATION.md.
+The gate tool normalizes two kernel choices so both sides run the same
+math (kernel-choice differences, not data differences — see
+docs/INTEGRATION.md): CPU weight repacking is off (`use_extra_bufts =
+false` — the interleaved kernels sum in a different order than the plain
+kernels the pool tensors use), and host-op offload is off (`op_offload =
+false` — at partial offload the scheduler may ship CPU-resident ops to
+the GPU, and the pack graph's custom-op splits change which ops qualify,
+so stock and pack would otherwise run different kernels on different
+devices).
 
 ## Measured decode speed (Phase 2.4)
 
@@ -197,6 +204,49 @@ RAM story holds at 120B scale: the whole decode ran inside a
 `--memory=4g` cgroup at full speed (24.5 → 23.3 within noise), peak
 3.1GB — most of which is the one-time 2.3GB resident-weight load
 streaming through page cache.
+
+## Qwen3-Next-80B-A3B — the usable-flagship tier (Phase 3's pick)
+
+The planner's recommendation made real, same day: Qwen3-Next-80B-A3B
+Instruct Q4_K_M (48.5GB GGUF; 48 MoE layers × 512 experts top-10 + a
+shared expert; ~3B active) — the ultra-sparse geometry this design was
+aimed at from Phase 0. Repack 54s → 24,576 extents of 1.7-1.9MB (96.5%
+paged, zero alignment padding), byte-verified. First **hybrid-attention**
+architecture (gated delta net + full attention) through the pack:
+**bit-identical logits** on CPU (heavy eviction + prefetch) *and* on the
+CUDA backend at `-ngl 14` with the pools split across CPU and GPU.
+
+| config | host RAM | pp512 | decode (tg128) |
+|---|---|---|---|
+| **nvmoe pack, 11.5GB VRAM cache (planner's pick), warm** | **~1GB** | 134.6 ± 2.9 | **44.8 ± 2.6** |
+| nvmoe pack, same, inside a `--memory=4g` cgroup | 1.01GB peak, measured | — | 38.9 ± 3.6 *(cold-inclusive)* |
+| stock, best partial offload (`-ngl 14`) | ~33GB (page cache) | 272.6 ± 73.5 | 22.6 ± 0.4 |
+| stock, experts in RAM (`-ot exps=CPU -ngl 99`) | ~44GB | — | 20.9 ± 5.6 |
+| stock, full VRAM | — | *does not fit* | *does not fit* |
+
+**Cache sweep** (decode-only `-p 0 -n 128 -r 3`, includes cold start) —
+the first model where the 1.9MB extents sit far under the 6MB speculation
+gate, and lookahead prefetch pays at *every* fetch-bound budget:
+
+| NVMOE_CACHE_MB | share of experts | sync fetch | + lookahead prefetch |
+|---|---|---|---|
+| 4096 | ~9% | 18.0 ± 0.7 | **20.2 ± 0.6** (+12%) |
+| 8192 | ~18% | 27.3 ± 1.0 | **31.9 ± 0.9** (+17%) |
+| 11776 | ~26% | 35.4 ± 4.0 | **39.9 ± 3.6** (+13%) |
+
+The lookahead predictor's fifth architecture lands in the same band as
+the other four: 84.4-84.5% of routed ids predicted one layer ahead
+(top-10), with 81% of speculative fetches used.
+
+```bash
+python3 tools/plan.py models/qwen3-next-80b-a3b-instruct-q4_k_m.gguf   # prints all of this
+python3 tools/repack_gguf.py models/qwen3-next-80b-a3b-instruct-q4_k_m.gguf
+python3 tools/verify_pack.py models/qwen3-next-80b-a3b-instruct-q4_k_m.nvmoe \
+    models/qwen3-next-80b-a3b-instruct-q4_k_m.gguf
+NVMOE_CACHE_MB=11776 ./build-cuda/bin/llama-bench \
+    -m models/qwen3-next-80b-a3b-instruct-q4_k_m.nvmoe/resident.gguf \
+    -ngl 99 -p 512 -n 128 -r 5 -t 8
+```
 
 ## DeepSeek-V2-Lite — third architecture, and what paging costs when you don't need it
 

@@ -101,6 +101,14 @@ Two things we learned the hard way, kept here so nobody re-learns them:
   target is the GPU backend.)
 - The ids tensor from `argsort_top_k` is a strided view; the custom op
   takes a `ggml_cont` of it.
+- **Host-op offload changes the math at partial offload.** With
+  `-ngl < n_layers`, the scheduler may ship a CPU-resident op to the GPU
+  when it looks profitable — and the pack graph's custom-op splits change
+  which ops qualify, so stock and pack end up running different kernels
+  on different devices. The symptom is a flat ~1e-1 logit offset from
+  step 0 with identical greedy tokens (first seen on Qwen3-Next's hybrid
+  attention at `-ngl 14`). The gate tool sets `op_offload = false` on
+  both sides, same rationale as `use_extra_bufts`.
 
 Known quirk, not yet chased: upstream's `llama-eval-callback` example
 segfaults on a pack model (our own dump mode in `llama-nvmoe-logits -d`

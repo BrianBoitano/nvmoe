@@ -191,6 +191,13 @@ def main() -> None:
     if not paged:
         raise SystemExit("error: no blk.*.ffn_*_exps.weight tensors found — "
                          "not a MoE GGUF (or a dense model; nothing to page)")
+    fused = [t.name for t in resident if "ffn_gate_up_exps" in t.name]
+    if fused:
+        raise SystemExit(f"error: fused gate+up expert tensors ({fused[0]} ...) — "
+                         f"paging only the down projection would defeat the point, "
+                         f"and the runtime's pack path expects separate "
+                         f"gate/up/down. Re-convert the model with separate "
+                         f"expert tensors.")
     layers, groups, kinds, n_expert, pack_size = plan_pack(info, paged)
 
     arch = info.kv.get("general.architecture", "unknown")

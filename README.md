@@ -7,7 +7,7 @@ Modern flagship open-weight models (DeepSeek-R1 671B, Qwen3-Next-80B, GPT-OSS-12
 ## Who is this for
 
 - **You have a 8-24GB GPU and want to run models that don't fit.** Measured, not simulated: Qwen3-30B-A3B (18.6GB, doesn't fit a 16GB card) decodes at **166 tok/s** from its NVMe pack — 2.1x the best llama.cpp offload split — using 756MB of host RAM. **GPT-OSS-120B (63GB) decodes at 24.5 tok/s** on the same card, ~3x the best stock configuration this box can attempt, inside a 4GB memory cgroup ([tables](runtime/README.md)).
-- **You want the big ones.** DeepSeek-R1 671B (dynamic 1.58-bit, 131GB on disk) pencils out to ~2 tok/s on a 16GB card + consumer SSD. Slow, but it *runs*, on hardware that costs less than the RAM other approaches require.
+- **You want a flagship you'll actually use.** Qwen3-Next-80B-A3B (48.5GB) decodes at **44.8 tok/s** from its pack on the 16GB reference card — measured, warm, with ~1GB of host RAM. The 80-120B ultra-sparse tier is this design's sweet spot: big enough to be a real flagship, sparse enough to cache. (The 671B-class runs too — DeepSeek-R1 pencils out to ~2 tok/s — but flat DeepSeek-family routing makes that a capacity proof, not a daily driver.)
 - **Your RAM is spoken for.** Every existing offload system (KTransformers, Fiddler, llama.cpp's `exps=CPU`) parks expert weights in system RAM. If your machine runs a Docker stack, a game, or VMs, that RAM isn't free. nvmoe bypasses the page cache entirely (O_DIRECT) and caps host memory use.
 
 ## The idea in plain English
@@ -118,19 +118,21 @@ python3 tools/plan.py model.gguf --vram-gb 24 --nvme-gbps 12          # your box
 python3 tools/plan.py --postdict                                      # its receipts
 ```
 
-`--postdict` is the honesty check: the planner re-predicts the eight
+`--postdict` is the honesty check: the planner re-predicts the eleven
 configurations measured in [runtime/README.md](runtime/README.md) and prints
 predicted vs measured side by side. Its hit-rate model lands within a few
 points of live runtime counters on real prompts; measured `llama-bench`
-decode lands 0.7-2.1x of the predicted tok/s, and the tail is systematic —
+decode lands 0.7-2.5x of the predicted tok/s, and the tail is systematic —
 `-p 0` benchmark generation routes far more repetitively than real
-workloads, most of all on flat-routing DeepSeek-family models. The planner
-predicts real use, not benchmark flattery, and reports that spread as its
-error bars.
+workloads, most of all on flat-routing DeepSeek-family models and at small
+caches on fine-grained-expert models. The planner predicts real use, not
+benchmark flattery, and reports that spread as its error bars.
 
 ## Measured results (reproducible with the commands above)
 
 **The runtime works, end to end.** Qwen3-30B-A3B Q4_K_M (18.6GB GGUF, does not fit in 16GB VRAM) decodes at **166.1 ± 2.2 tok/s** from its pack with a 12GB VRAM expert cache and synchronous fetch-on-miss — vs 79.2 for stock llama.cpp's best partial offload and 45.2 for the experts-in-RAM recipe (which needs ~17GB of free host RAM; nvmoe used **756MB peak, measured inside a hard 4GB cgroup**). Cache-budget sweep, prefill caveat, and every command: [runtime/README.md](runtime/README.md). Correctness bar: **bit-identical logits vs stock**, CPU and CUDA, including under heavy cache eviction.
+
+**The sweet spot is real: an 80B flagship at reading speed.** Qwen3-Next-80B-A3B (Q4_K_M, 48.5GB, ~3B active) — the model the planner picked as this design's best fit — decodes at **44.8 ± 2.6 tok/s** warm from its pack at an 11.5GB VRAM cache: 2.0x the best stock partial offload and 2.1x the experts-in-RAM recipe (which wants ~44GB of RAM; the pack run peaked at **1.01GB, measured in a hard 4GB cgroup at full speed**). It is the first hybrid-attention architecture through the pack (bit-identical logits, CPU and split-offload CUDA) and the first model where lookahead prefetch pays at every cache budget (+12-17% — its 1.9MB extents are exactly what the prefetcher was built for). Tables and commands: [runtime/README.md](runtime/README.md).
 
 **It scales to models 4x the card.** GPT-OSS-120B (MXFP4, 63GB GGUF, 5.1B active) decodes at **24.5 ± 3.3 tok/s** with an 11GB VRAM expert cache — 2.2x the simulator's conservative ceiling and ~3x the best stock configuration this 64GB-RAM box can attempt (`exps=CPU` manages 8.3 ± 4.0 while monopolizing ~57GB of page cache; nvmoe's whole decode ran inside a **hard 4GB cgroup at full speed**, 3.1GB peak). The pack: 4,608 extents of 12.6MB, 96.1% of the file paged, byte-identical repack in 68s, logits gate passed.
 
@@ -182,8 +184,11 @@ Prefill is the known weak spot: a long prompt touches nearly every expert (~18s 
   - [x] **2.3c(ii) router-logit lookahead prefetch**: predict layer L+1's experts from layer L's hidden state (one folded matmul per layer — **~86% of routed ids at top-8**, measured) and fetch them during L's compute via a priority fetch pool; +4-7% decode at fetch-bound budgets, auto-off near-resident, still bit-identical. The offline-table alternative was evaluated against real traces and rejected (`tools/analyze_lookahead.py`)
   - [x] **2.4 measured tok/s on Qwen3-30B-A3B** ([tables + commands](runtime/README.md)): **166 tok/s decode from the pack at a 12GB VRAM cache — 2.1x the best stock offload split, 3.7x the exps-in-RAM recipe — with 756MB peak host RAM, proven inside a hard 4GB cgroup.**
   - [x] **2.4b GPT-OSS-120B** ([tables + commands](runtime/README.md)): a 63GB model on the 16GB card — **24.5 tok/s decode at an 11GB cache, ~3x the best stock attempt, inside a 4GB cgroup**; the sweep (10.5/18.7/24.5 at 4/8/11GB) tracks the hit-rate curves, and its 12.6MB extents produced the extent-size speculation gate (wasted prefetch guesses cost more than they hide on fetch-bound decode)
-- [x] **Phase 3 — planner** (`tools/plan.py`): reads any MoE GGUF's geometry, takes your VRAM/SSD numbers, and emits the placement plan — cache budget, prefetch setting, expected decode range, and the exact repack/verify/gate/bench commands. Validated by postdiction: `--postdict` reprints its predictions against all eight measured configurations (0.7-2x, with the systematic direction explained there)
-- [ ] **Stunt flag**: DeepSeek-R1 671B, 16GB VRAM, ≤4GB RAM, on video
+- [x] **Phase 3 — planner** (`tools/plan.py`): reads any MoE GGUF's geometry, takes your VRAM/SSD numbers, and emits the placement plan — cache budget, prefetch setting, expected decode range, and the exact repack/verify/gate/bench commands. Validated by postdiction: `--postdict` reprints its predictions against all eleven measured configurations (0.7-2.5x, with the systematic direction explained there)
+- [x] **The usable-flagship tier — Qwen3-Next-80B-A3B** ([tables + commands](runtime/README.md)): the planner's pick, measured same-day — **44.8 tok/s warm decode at an 11.5GB cache, 2.0x the best stock offload, at full speed inside a 4GB cgroup with a 1.01GB peak**; first hybrid-attention architecture through the pack (bit-identical CPU and split-offload GPU), and the first model where lookahead prefetch pays at every budget (+12-17%)
+- [ ] **Second sweet-spot model**: GLM-4.5-Air 106B-A12B (`glm4moe`, supported by the pinned base) — a routing family this repo hasn't traced yet
+
+*(A DeepSeek-R1-671B run was on the roadmap as a capacity stunt. The planner's own postdiction killed it: flat DeepSeek-family routing + a cache budget pinned at its 3.1% thrash cliff pencils out to 1-3 tok/s at visible 1.58-bit quality loss — it would prove VRAM isn't the wall, but nobody would use it. The 16GB card's real win is the tier below, where decode is faster than reading speed.)*
 
 ## Repo map
 

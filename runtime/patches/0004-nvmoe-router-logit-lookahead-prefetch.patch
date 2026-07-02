@@ -41,13 +41,32 @@ without speculative I/O.
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 ---
- src/llama-context.cpp |   6 +
- src/llama-graph.cpp   |  18 +-
- src/llama-model.cpp   |  14 +
- src/llama-nvmoe.cpp   | 582 +++++++++++++++++++++++++++++++++++++++---
- src/llama-nvmoe.h     |  89 ++++++-
- 5 files changed, 667 insertions(+), 42 deletions(-)
+ examples/nvmoe-logits/nvmoe-logits.cpp |   7 +
+ src/llama-context.cpp                  |   6 +
+ src/llama-graph.cpp                    |  18 +-
+ src/llama-model.cpp                    |  14 +
+ src/llama-nvmoe.cpp                    | 582 +++++++++++++++++++++++--
+ src/llama-nvmoe.h                      |  89 +++-
+ 6 files changed, 674 insertions(+), 42 deletions(-)
 
+diff --git a/examples/nvmoe-logits/nvmoe-logits.cpp b/examples/nvmoe-logits/nvmoe-logits.cpp
+index 66a5d61..3a548a6 100644
+--- a/examples/nvmoe-logits/nvmoe-logits.cpp
++++ b/examples/nvmoe-logits/nvmoe-logits.cpp
+@@ -108,6 +108,13 @@ int main(int argc, char ** argv) {
+     cparams.n_ctx           = 4096;
+     cparams.n_threads       = n_threads;
+     cparams.n_threads_batch = n_threads;
++    // no host-op offload: with partial offload (-ngl < n_layers) the
++    // scheduler may ship CPU-resident ops to the GPU, and the pack graph's
++    // custom-op splits change which ops qualify — stock and pack then run
++    // different kernels on different devices (flat ~1e-1 logit offsets,
++    // same greedy tokens). Pin host ops to the CPU on both sides, like
++    // use_extra_bufts above: normalize the kernel choice, compare the data.
++    cparams.op_offload      = false;
+ 
+     FILE * fdump = nullptr;
+     if (!dump_path.empty()) {
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
 index c2beca8..584b874 100644
 --- a/src/llama-context.cpp
