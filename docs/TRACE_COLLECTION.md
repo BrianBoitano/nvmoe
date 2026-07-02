@@ -4,27 +4,31 @@ Phase 1 replaces the synthetic traces in `sim/trace_gen.py` with measured
 routing decisions. The cache simulator consumes them via `--trace` (JSONL,
 one line per token, each line a JSON array of `[layer, expert_id]` pairs).
 
-## Approach: eval callback, no fork needed
+## The collector (built, working)
 
-llama.cpp exposes `ggml_backend_sched_eval_callback` (wired through
-`common_params.cb_eval`) — the same hook the `llama-imatrix` tool uses to
-observe intermediate tensors. During graph execution the MoE routing tensors
-are observable by name:
+`collector/nvmoe-trace.cpp` is a small llama.cpp example tool that registers
+a `cb_eval` scheduler callback (`llama_context_params.cb_eval`) and dumps the
+`ffn_moe_topk-<il>` tensors — the selected expert ids per token per MoE layer
+(I32, shape `[top_k, n_tokens]`) — as raw JSONL. Install and build it inside
+any llama.cpp checkout:
 
-- `ffn_moe_topk-<il>` — the selected expert ids per token for layer `<il>`
-  (output of the top-k over router logits in `build_moe_ffn`)
-- `ffn_moe_probs-<il>` — router probabilities (useful later for training the
-  prefetch predictor, not needed for cache simulation)
+```bash
+./collector/install.sh /path/to/llama.cpp
+# then:
+llama-nvmoe-trace -m model.gguf -f prompts/chat.txt -o traces/run.raw.jsonl -n 400
+python3 sim/trace_post.py traces/run.raw.jsonl --stats
+python3 sim/trace_post.py traces/run.raw.jsonl --decode-only -o traces/run.tokens.jsonl
+```
 
-Collector sketch (C++, modeled on `examples/imatrix/imatrix.cpp`):
+Gotcha handled by `trace_post.py`: during prefill llama.cpp computes the
+final layer only for output rows, so that layer's record has a smaller
+`n_tokens` than the rest of the step — short records align to the trailing
+token positions. Related tensor for the Phase 2 prefetch predictor:
+`ffn_moe_probs-<il>` (router probabilities).
 
-1. Register a `cb_eval` that returns true (ask for data) for tensors whose
-   name starts with `ffn_moe_topk-`.
-2. In the callback, copy the tensor to host (`ggml_backend_tensor_get`),
-   decode the int32 expert ids — shape is `[top_k, n_tokens]`.
-3. Buffer per-token selections across layers; flush one JSONL line per token
-   position: `[[layer, e0], [layer, e1], ...]` in layer order.
-4. Run a normal generation (`llama-cli` flow) over representative workloads.
+`tools/collect_qwen_traces.sh` runs the standard four-workload suite.
+`sim/calibrate.py` fits the synthetic generator to a real trace and reports
+the real-vs-synthetic LRU hit-rate curve.
 
 ## Calibration models for the PlexyLady box (no dedicated RAM)
 

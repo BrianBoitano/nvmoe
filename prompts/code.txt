@@ -1,0 +1,3 @@
+<|im_start|>user
+Write a Python class LRUCache with get/put methods in O(1) using a doubly linked list and dict, then add a method resize(new_capacity) that shrinks or grows the cache correctly. Include type hints and docstrings, then show a usage example with edge cases.<|im_end|>
+<|im_start|>assistant

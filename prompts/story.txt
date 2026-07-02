@@ -1,0 +1,3 @@
+<|im_start|>user
+Write the opening chapter of a mystery novel set in a small fishing town on Puget Sound. A retired ferry captain finds something impossible washed up at low tide. Atmospheric, literary style, strong sense of place.<|im_end|>
+<|im_start|>assistant

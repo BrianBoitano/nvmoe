@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
 .venv/
-traces/*.jsonl
+models/
+traces/*.raw.jsonl
 *.gguf
+nvme_testfile

@@ -74,6 +74,19 @@ MODELS = {
         expert_params=3 * 2880 * 2880, expert_bits=4.25,
         always_on_gb=2.5, kv_gb=1.5,
     ),
+    # calibration models — small enough to trace on one box (see docs/TRACE_COLLECTION.md)
+    "qwen3-30b-a3b": ModelPreset(
+        name="Qwen3-30B-A3B (4.5-bit, calibration model)",
+        moe_layers=48, experts_per_layer=128, top_k=8,
+        expert_params=3 * 2048 * 768, expert_bits=4.5,
+        always_on_gb=1.5, kv_gb=1.0,
+    ),
+    "olmoe-7b": ModelPreset(
+        name="OLMoE-1B-7B (4-bit, collector smoke-test model)",
+        moe_layers=16, experts_per_layer=64, top_k=8,
+        expert_params=3 * 2048 * 1024, expert_bits=4.5,
+        always_on_gb=0.7, kv_gb=0.5,
+    ),
     "mixtral-8x7b": ModelPreset(
         name="Mixtral-8x7B (4.5-bit, calibration model)",
         moe_layers=32, experts_per_layer=8, top_k=2,

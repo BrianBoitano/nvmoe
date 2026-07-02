@@ -1,0 +1,3 @@
+<|im_start|>user
+I'm setting up a home server for media streaming and photo backup. I have a mini PC with 32GB RAM and a 4TB drive. Walk me through how you'd organize the storage, what services you'd run, and how you'd handle backups. Be specific and practical.<|im_end|>
+<|im_start|>assistant
