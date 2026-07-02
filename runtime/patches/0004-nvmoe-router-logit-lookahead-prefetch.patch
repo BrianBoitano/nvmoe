@@ -43,10 +43,10 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 ---
  src/llama-context.cpp |   6 +
  src/llama-graph.cpp   |  18 +-
- src/llama-model.cpp   |  10 +
- src/llama-nvmoe.cpp   | 554 +++++++++++++++++++++++++++++++++++++++---
- src/llama-nvmoe.h     |  77 +++++-
- 5 files changed, 623 insertions(+), 42 deletions(-)
+ src/llama-model.cpp   |  14 ++
+ src/llama-nvmoe.cpp   | 564 +++++++++++++++++++++++++++++++++++++++---
+ src/llama-nvmoe.h     |  83 ++++++-
+ 5 files changed, 643 insertions(+), 42 deletions(-)
 
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
 index c2beca8..584b874 100644
@@ -95,10 +95,10 @@ index 1f67067..e96d676 100644
  
          gate_exps = llama_nvmoe_pool(lyr, LLAMA_NVMOE_GATE);
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index f5b4268..1c20ccd 100644
+index f5b4268..f1372ab 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -1636,6 +1636,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1636,6 +1636,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
              layer_dev[il] = pimpl->dev_layer[il].dev;
          }
          nvmoe.reset(llama_nvmoe_init(ml.nvmoe_dir, ml.nvmoe_manifest, cache_bytes, layer_dev));
@@ -107,16 +107,20 @@ index f5b4268..1c20ccd 100644
 +        // router (both loaded above) into per-layer lookahead routers
 +        std::vector<ggml_tensor *> lk_norm(n_layer_all, nullptr);
 +        std::vector<ggml_tensor *> lk_gate(n_layer_all, nullptr);
++        std::vector<ggml_tensor *> lk_gate_b(n_layer_all, nullptr);
 +        for (int il = 0; il < n_layer_all && (size_t) il < layers.size(); ++il) {
-+            lk_norm[il] = layers[il].ffn_norm;
-+            lk_gate[il] = layers[il].ffn_gate_inp;
++            // most MoE archs norm the FFN input with ffn_norm; gpt-oss
++            // style archs use attn_post_norm for the same position
++            lk_norm[il]   = layers[il].ffn_norm ? layers[il].ffn_norm : layers[il].attn_post_norm;
++            lk_gate[il]   = layers[il].ffn_gate_inp;
++            lk_gate_b[il] = layers[il].ffn_gate_inp_b;
 +        }
-+        llama_nvmoe_init_lookahead(nvmoe.get(), lk_norm, lk_gate);
++        llama_nvmoe_init_lookahead(nvmoe.get(), lk_norm, lk_gate, lk_gate_b);
      }
  
      return true;
 diff --git a/src/llama-nvmoe.cpp b/src/llama-nvmoe.cpp
-index 2ccfaef..b50b427 100644
+index 2ccfaef..68dfaa2 100644
 --- a/src/llama-nvmoe.cpp
 +++ b/src/llama-nvmoe.cpp
 @@ -26,11 +26,40 @@ static const char * llama_nvmoe_kind_names[LLAMA_NVMOE_KIND_COUNT] = {
@@ -175,7 +179,7 @@ index 2ccfaef..b50b427 100644
          g.buft = s.buft;
      }
  
-@@ -322,6 +353,224 @@ llama_nvmoe_context * llama_nvmoe_init(const std::string & pack_dir, const std::
+@@ -322,6 +353,230 @@ llama_nvmoe_context * llama_nvmoe_init(const std::string & pack_dir, const std::
      return ctx.release();
  }
  
@@ -221,7 +225,8 @@ index 2ccfaef..b50b427 100644
 +
 +void llama_nvmoe_init_lookahead(llama_nvmoe_context * nc,
 +        const std::vector<ggml_tensor *> & ffn_norm,
-+        const std::vector<ggml_tensor *> & gate_inp) {
++        const std::vector<ggml_tensor *> & gate_inp,
++        const std::vector<ggml_tensor *> & gate_inp_b) {
 +    // auto default: lookahead pays for itself where misses are plentiful
 +    // (small cache budgets) and costs ~4% where they are not (its extra
 +    // mul_mat launches, with CUDA graphs already disabled by the custom op,
@@ -342,6 +347,11 @@ index 2ccfaef..b50b427 100644
 +                    p.w[(size_t) e * n_embd + h] = router[(size_t) e * n_embd + h] * r;
 +                }
 +            }
++            // the target layer's router bias participates in its top-k, so
++            // the prediction must rank with it too (added on the CPU)
++            if ((size_t) jl < gate_inp_b.size() && gate_inp_b[jl]) {
++                lyr->lk_bias[k] = read_f32(gate_inp_b[jl]);
++            }
 +            lk_bytes += (int64_t) p.w.size() * sizeof(float);
 +            plans.push_back(std::move(p));
 +        }
@@ -400,7 +410,7 @@ index 2ccfaef..b50b427 100644
  llama_nvmoe_layer * llama_nvmoe_get_layer(const llama_nvmoe_context * ctx, int il) {
      if (il < 0 || (size_t) il >= ctx->layers.size()) {
          return nullptr;
-@@ -362,28 +611,41 @@ static void llama_nvmoe_fetch(llama_nvmoe_layer * lyr, int32_t expert, int32_t s
+@@ -362,28 +617,41 @@ static void llama_nvmoe_fetch(llama_nvmoe_layer * lyr, int32_t expert, int32_t s
      }
  }
  
@@ -461,7 +471,7 @@ index 2ccfaef..b50b427 100644
  
      const int64_t n = ggml_nelements(a);
      const int32_t * ids = (const int32_t *) a->data;
-@@ -404,25 +666,11 @@ static void llama_nvmoe_fetch_op(ggml_tensor * dst, const ggml_tensor * a, int i
+@@ -404,25 +672,11 @@ static void llama_nvmoe_fetch_op(ggml_tensor * dst, const ggml_tensor * a, int i
          } else {
              nc->n_miss++;
  
@@ -489,7 +499,7 @@ index 2ccfaef..b50b427 100644
  
              g.slot_key[slot] = key;
              g.where[key]     = slot;
-@@ -464,10 +712,238 @@ static void llama_nvmoe_fetch_op(ggml_tensor * dst, const ggml_tensor * a, int i
+@@ -464,10 +718,242 @@ static void llama_nvmoe_fetch_op(ggml_tensor * dst, const ggml_tensor * a, int i
      nc->n_bytes    += misses.size() * lyr->group_stride;
  }
  
@@ -595,8 +605,12 @@ index 2ccfaef..b50b427 100644
 +            for (int32_t e = 0; e < nc->n_expert; e++) {
 +                idx[e] = e;
 +            }
++            const float * bias = lyr->lk_bias[k].empty() ? nullptr : lyr->lk_bias[k].data();
 +            std::partial_sort(idx.begin(), idx.begin() + m, idx.end(),
-+                    [logits](int32_t x, int32_t y) { return logits[x] > logits[y]; });
++                    [logits, bias](int32_t x, int32_t y) {
++                        const float bx = bias ? bias[x] : 0.0f, by = bias ? bias[y] : 0.0f;
++                        return logits[x] + bx > logits[y] + by;
++                    });
 +            pred_ids.insert(pred_ids.end(), idx.begin(), idx.begin() + m);
 +        }
 +
@@ -730,7 +744,7 @@ index 2ccfaef..b50b427 100644
      return ggml_map_custom1(ctx0, selected_experts, llama_nvmoe_fetch_op, 1, lyr);
  }
 diff --git a/src/llama-nvmoe.h b/src/llama-nvmoe.h
-index e9478ed..81c492c 100644
+index e9478ed..68c8049 100644
 --- a/src/llama-nvmoe.h
 +++ b/src/llama-nvmoe.h
 @@ -22,9 +22,13 @@
@@ -747,7 +761,7 @@ index e9478ed..81c492c 100644
  #include <unordered_map>
  #include <vector>
  
-@@ -59,6 +63,18 @@ struct llama_nvmoe_layer {
+@@ -59,6 +63,22 @@ struct llama_nvmoe_layer {
      size_t group_stride = 0; // padded to pack alignment
  
      std::vector<uint64_t> ext_off; // absolute pack offset per expert
@@ -760,13 +774,17 @@ index e9478ed..81c492c 100644
 +    int           il_next[2]   = { -1, -1 };           // next paged MoE layers
 +    ggml_tensor * lk_router[2] = { nullptr, nullptr }; // [n_embd, n_expert] F32, on this layer's device
 +
++    // router bias of il_next[k] (empty if the arch has none), added during
++    // the op's CPU top-k so predictions rank like the real router's logits
++    std::vector<float> lk_bias[2];
++
 +    // ids predicted FOR this layer at earlier ops, per horizon (graph thread
 +    // only; [0] set one layer back, [1] two layers back)
 +    std::vector<int32_t> pred[2];
  };
  
  // layers with identical part geometry AND the same target buffer type share
-@@ -75,6 +91,8 @@ struct llama_nvmoe_group {
+@@ -75,6 +95,8 @@ struct llama_nvmoe_group {
      std::vector<int64_t>  slot_key;  // -1 = empty
      std::vector<uint64_t> slot_used; // last-use tick (LRU)
      std::vector<uint64_t> slot_op;   // op epoch that pinned the slot
@@ -775,7 +793,7 @@ index e9478ed..81c492c 100644
      std::unordered_map<int64_t, int32_t> where;
  };
  
-@@ -111,12 +129,48 @@ struct llama_nvmoe_context {
+@@ -111,12 +133,48 @@ struct llama_nvmoe_context {
      uint64_t tick  = 0; // LRU clock
      uint64_t epoch = 0; // custom-op invocation counter (for per-op pinning)
  
@@ -824,16 +842,18 @@ index e9478ed..81c492c 100644
      ~llama_nvmoe_context();
  };
  
-@@ -126,11 +180,30 @@ struct llama_nvmoe_context {
+@@ -126,11 +184,32 @@ struct llama_nvmoe_context {
  llama_nvmoe_context * llama_nvmoe_init(const std::string & pack_dir, const std::string & manifest_name, int64_t cache_bytes,
          const std::vector<ggml_backend_dev_t> & layer_dev);
  
 +// after weights load: build the lookahead routers and start the fetch pool.
-+// ffn_norm / gate_inp are the model's per-layer tensors, indexed by il
-+// (null where absent); layers without both are skipped.
++// ffn_norm / gate_inp / gate_inp_b are the model's per-layer tensors,
++// indexed by il (null where absent; gate_inp_b optional); layers without
++// norm + router are skipped.
 +void llama_nvmoe_init_lookahead(llama_nvmoe_context * ctx,
 +        const std::vector<ggml_tensor *> & ffn_norm,
-+        const std::vector<ggml_tensor *> & gate_inp);
++        const std::vector<ggml_tensor *> & gate_inp,
++        const std::vector<ggml_tensor *> & gate_inp_b);
 +
  // per-layer handle for graph building; null if il is not a paged MoE layer
  llama_nvmoe_layer * llama_nvmoe_get_layer(const llama_nvmoe_context * ctx, int il);
