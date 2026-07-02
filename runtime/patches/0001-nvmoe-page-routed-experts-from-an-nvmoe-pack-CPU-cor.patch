@@ -1,0 +1,1021 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Ayers <brianboitano87@gmail.com>
+Date: Thu, 2 Jul 2026 08:45:52 -0700
+Subject: [PATCH] nvmoe: page routed experts from an nvmoe pack (CPU
+ correctness stage)
+
+Loading a pack's resident.gguf (detected via the nvmoe.pack.version KV)
+now works end to end: the routed-expert weights are never loaded into
+memory. Instead, src/llama-nvmoe.{h,cpp} owns pool tensors
+[ne0, ne1, n_slots] per matrix kind, shared across layers with the same
+geometry, backed by an LRU cache keyed (layer, expert). build_moe_ffn()
+inserts a custom op on the selected-experts ids that synchronously
+fetches missing experts from experts.pack (O_DIRECT pread) and remaps
+the ids to pool slots, so ggml_mul_mat_id runs unchanged. Everything
+indexed by real expert id (routing probs, per-expert biases) keeps the
+original ids.
+
+Cache size defaults to all experts resident; NVMOE_CACHE_MB caps it
+(floored at n_expert slots per group so any single op fits).
+
+examples/nvmoe-logits is the correctness gate: it greedy-decodes a
+fixed prompt and dumps full logits per step. With CPU weight repacking
+disabled (pool tensors are plain buffers, so both runs must use the
+plain kernels for an apples-to-apples comparison), stock GGUF vs pack
+is BIT-IDENTICAL on OLMoE-1B-7B (32 and 48 steps, also under heavy
+cache eviction at NVMOE_CACHE_MB=512) and on Qwen3-30B-A3B (24 steps,
+two pool groups, mixed Q4_K/Q6_K layers).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ examples/CMakeLists.txt                |   1 +
+ examples/nvmoe-logits/CMakeLists.txt   |   5 +
+ examples/nvmoe-logits/nvmoe-logits.cpp | 195 +++++++++++++
+ src/CMakeLists.txt                     |   2 +
+ src/llama-context.cpp                  |   1 +
+ src/llama-graph.cpp                    |  30 +-
+ src/llama-graph.h                      |   7 +
+ src/llama-model-loader.cpp             |  10 +
+ src/llama-model-loader.h               |   6 +
+ src/llama-model.cpp                    |  19 ++
+ src/llama-model.h                      |   4 +
+ src/llama-nvmoe.cpp                    | 374 +++++++++++++++++++++++++
+ src/llama-nvmoe.h                      | 121 ++++++++
+ 13 files changed, 772 insertions(+), 3 deletions(-)
+ create mode 100644 examples/nvmoe-logits/CMakeLists.txt
+ create mode 100644 examples/nvmoe-logits/nvmoe-logits.cpp
+ create mode 100644 src/llama-nvmoe.cpp
+ create mode 100644 src/llama-nvmoe.h
+
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index 39f802d..9db0c34 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -28,6 +28,7 @@ else()
+     add_subdirectory(passkey)
+     add_subdirectory(retrieval)
+     add_subdirectory(simple)
++    add_subdirectory(nvmoe-logits)
+     add_subdirectory(simple-chat)
+     add_subdirectory(speculative)
+     add_subdirectory(speculative-simple)
+diff --git a/examples/nvmoe-logits/CMakeLists.txt b/examples/nvmoe-logits/CMakeLists.txt
+new file mode 100644
+index 0000000..4b7fe53
+--- /dev/null
++++ b/examples/nvmoe-logits/CMakeLists.txt
+@@ -0,0 +1,5 @@
++set(TARGET llama-nvmoe-logits)
++add_executable(${TARGET} nvmoe-logits.cpp)
++install(TARGETS ${TARGET} RUNTIME)
++target_link_libraries(${TARGET} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET} PRIVATE cxx_std_17)
+diff --git a/examples/nvmoe-logits/nvmoe-logits.cpp b/examples/nvmoe-logits/nvmoe-logits.cpp
+new file mode 100644
+index 0000000..66a5d61
+--- /dev/null
++++ b/examples/nvmoe-logits/nvmoe-logits.cpp
+@@ -0,0 +1,195 @@
++// nvmoe-logits: the nvmoe correctness gate.
++//
++// Greedy-decodes N tokens from a fixed prompt and dumps the FULL logits
++// vector at every step to a binary file. Run it twice — once on the original
++// GGUF, once on the pack's resident.gguf — and compare the dumps with
++// nvmoe's tools/compare_logits.py. On the CPU backend the two dumps must be
++// byte-identical: the pack path computes the same matmuls on the same bytes.
++//
++// Deliberately raw llama.h API (no common/), so the tool itself has no
++// sampling, no warmup, and no hidden state.
++//
++// usage: llama-nvmoe-logits -m model.gguf -o out.bin [-p PROMPT] [-n N_GEN] [-t N_THREADS] [-ngl N]
++//
++// dump format (little-endian):
++//   char[8]  magic "NVMLOG01"
++//   u32      n_vocab
++//   u32      n_prompt,  u32 prompt_tokens[n_prompt]
++//   u32      n_steps
++//   per step: u32 chosen_token, f32 logits[n_vocab]
++
++#include "llama.h"
++#include "ggml.h"
++#include "ggml-backend.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++// -d mode: print a checksum line for every observed graph tensor, to bisect
++// where two runs diverge (compare the logs with diff)
++static bool dump_cb(struct ggml_tensor * t, bool ask, void * user_data) {
++    if (ask) {
++        return t->name[0] != '\0';
++    }
++    FILE * f = (FILE *) user_data;
++    if (t->type == GGML_TYPE_F32) {
++        std::vector<float> v(ggml_nelements(t));
++        ggml_backend_tensor_get(t, v.data(), 0, v.size() * sizeof(float));
++        double sum = 0;
++        for (float x : v) sum += (double) x;
++        fprintf(f, "%-40s %14.6e\n", t->name, sum);
++    } else if (t->type == GGML_TYPE_I32) {
++        std::vector<int32_t> v(ggml_nelements(t));
++        ggml_backend_tensor_get(t, v.data(), 0, v.size() * sizeof(int32_t));
++        long sum = 0;
++        for (int32_t x : v) sum += x;
++        fprintf(f, "%-40s i32 sum %ld\n", t->name, sum);
++    }
++    return true;
++}
++
++int main(int argc, char ** argv) {
++    std::string model_path;
++    std::string out_path;
++    std::string dump_path;
++    std::string prompt  = "The capital of France is";
++    int n_gen     = 32;
++    int n_threads = 8;
++    int n_gpu_layers = 0;
++
++    for (int i = 1; i < argc; i++) {
++        auto need = [&](const char * flag) -> const char * {
++            if (i + 1 >= argc) {
++                fprintf(stderr, "missing value for %s\n", flag);
++                exit(1);
++            }
++            return argv[++i];
++        };
++        if      (!strcmp(argv[i], "-m"))   model_path   = need("-m");
++        else if (!strcmp(argv[i], "-o"))   out_path     = need("-o");
++        else if (!strcmp(argv[i], "-d"))   dump_path    = need("-d");
++        else if (!strcmp(argv[i], "-p"))   prompt       = need("-p");
++        else if (!strcmp(argv[i], "-n"))   n_gen        = atoi(need("-n"));
++        else if (!strcmp(argv[i], "-t"))   n_threads    = atoi(need("-t"));
++        else if (!strcmp(argv[i], "-ngl")) n_gpu_layers = atoi(need("-ngl"));
++        else {
++            fprintf(stderr, "unknown arg %s\n", argv[i]);
++            return 1;
++        }
++    }
++    if (model_path.empty() || out_path.empty()) {
++        fprintf(stderr, "usage: %s -m model.gguf -o out.bin [-p PROMPT] [-n N_GEN] [-t N_THREADS] [-ngl N]\n", argv[0]);
++        return 1;
++    }
++
++    llama_backend_init();
++
++    llama_model_params mparams = llama_model_default_params();
++    mparams.n_gpu_layers = n_gpu_layers;
++    // no weight repacking: the CPU "extra" buffer types rewrite quantized
++    // weights into an interleaved layout whose kernels sum in a different
++    // order. nvmoe pool tensors are plain buffers, so for a bit-identical
++    // stock-vs-pack comparison both runs must use the plain kernels.
++    mparams.use_extra_bufts = false;
++
++    llama_model * model = llama_model_load_from_file(model_path.c_str(), mparams);
++    if (!model) {
++        fprintf(stderr, "failed to load %s\n", model_path.c_str());
++        return 1;
++    }
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
++
++    llama_context_params cparams = llama_context_default_params();
++    cparams.n_ctx           = 4096;
++    cparams.n_threads       = n_threads;
++    cparams.n_threads_batch = n_threads;
++
++    FILE * fdump = nullptr;
++    if (!dump_path.empty()) {
++        fdump = fopen(dump_path.c_str(), "w");
++        if (!fdump) {
++            fprintf(stderr, "cannot open %s\n", dump_path.c_str());
++            return 1;
++        }
++        cparams.cb_eval           = dump_cb;
++        cparams.cb_eval_user_data = fdump;
++    }
++
++    llama_context * ctx = llama_init_from_model(model, cparams);
++    if (!ctx) {
++        fprintf(stderr, "failed to create context\n");
++        return 1;
++    }
++
++    // tokenize
++    std::vector<llama_token> tokens(prompt.size() + 16);
++    const int n_prompt = llama_tokenize(vocab, prompt.c_str(), (int32_t) prompt.size(),
++            tokens.data(), (int32_t) tokens.size(), /*add_special*/ true, /*parse_special*/ false);
++    if (n_prompt <= 0) {
++        fprintf(stderr, "tokenization failed\n");
++        return 1;
++    }
++    tokens.resize(n_prompt);
++
++    FILE * fout = fopen(out_path.c_str(), "wb");
++    if (!fout) {
++        fprintf(stderr, "cannot open %s\n", out_path.c_str());
++        return 1;
++    }
++    fwrite("NVMLOG01", 1, 8, fout);
++    const uint32_t nv = n_vocab, np = n_prompt, ns = n_gen;
++    fwrite(&nv, 4, 1, fout);
++    fwrite(&np, 4, 1, fout);
++    for (auto t : tokens) {
++        const uint32_t u = t;
++        fwrite(&u, 4, 1, fout);
++    }
++    fwrite(&ns, 4, 1, fout);
++
++    // prompt, then greedy decode; dump logits after every llama_decode
++    llama_batch batch = llama_batch_get_one(tokens.data(), n_prompt);
++
++    fprintf(stderr, "prompt: '%s' (%d tokens), generating %d...\n", prompt.c_str(), n_prompt, n_gen);
++
++    llama_token cur = -1;
++    for (int step = 0; step < n_gen; step++) {
++        if (llama_decode(ctx, batch) != 0) {
++            fprintf(stderr, "llama_decode failed at step %d\n", step);
++            return 1;
++        }
++        const float * logits = llama_get_logits_ith(ctx, -1);
++
++        // greedy argmax, lowest id wins ties
++        cur = 0;
++        for (int32_t i = 1; i < n_vocab; i++) {
++            if (logits[i] > logits[cur]) {
++                cur = i;
++            }
++        }
++
++        const uint32_t u = cur;
++        fwrite(&u, 4, 1, fout);
++        fwrite(logits, 4, n_vocab, fout);
++
++        char buf[256];
++        const int n = llama_token_to_piece(vocab, cur, buf, sizeof(buf), 0, false);
++        fprintf(stderr, "%.*s", n > 0 ? n : 0, buf);
++        fflush(stderr);
++
++        batch = llama_batch_get_one(&cur, 1);
++    }
++    fprintf(stderr, "\n");
++    fclose(fout);
++
++    llama_perf_context_print(ctx);
++
++    llama_free(ctx);
++    llama_model_free(model);
++    llama_backend_free();
++    return 0;
++}
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 320784c..3482bc8 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -34,6 +34,7 @@ add_library(llama
+             llama-model-loader.cpp
+             llama-model-saver.cpp
+             llama-model.cpp
++            llama-nvmoe.cpp
+             llama-quant.cpp
+             llama-sampler.cpp
+             llama-vocab.cpp
+@@ -50,6 +51,7 @@ set_target_properties(llama PROPERTIES
+ )
+ 
+ target_include_directories(llama PRIVATE .)
++target_include_directories(llama PRIVATE ../vendor) # nlohmann/json.hpp for llama-nvmoe.cpp
+ target_include_directories(llama PUBLIC ../include)
+ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 0465430..c2beca8 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2419,6 +2419,7 @@ llm_graph_params llama_context::graph_params(
+         /*.n_outputs   =*/ n_outputs,
+         /*.cb          =*/ graph_get_cb(),
+         /*.res         =*/ res,
++        /*.nvmoe       =*/ model.nvmoe.get(),
+     };
+ }
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 4c86e43..1f67067 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -4,6 +4,7 @@
+ #include "llama-model.h"
+ #include "llama-batch.h"
+ #include "llama-cparams.h"
++#include "llama-nvmoe.h"
+ 
+ #include "llama-kv-cache.h"
+ #include "llama-kv-cache-iswa.h"
+@@ -1353,6 +1354,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+     samplers         (params.samplers),
+     cb_func          (params.cb),
+     res              (params.res),
++    nvmoe            (params.nvmoe),
+     ctx0             (res->get_ctx()),
+     gf               (res->get_gf()) {
+         res->set_params(params);
+@@ -1908,6 +1910,28 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     }
+     cb(selected_experts, "ffn_moe_topk", il);
+ 
++    // nvmoe: the routed-expert weights are paged from a pack. Swap in the
++    // expert-cache pool tensors and remap the selected ids to pool slots via
++    // a custom op that fetches missing experts; ggml_mul_mat_id itself runs
++    // unchanged. Everything indexed by *real* expert id (routing probs,
++    // per-expert biases/scales) keeps using the original selected_experts.
++    ggml_tensor * ids_mm = selected_experts;
++    if (nvmoe != nullptr && up_exps == nullptr && gate_up_exps == nullptr) {
++        llama_nvmoe_layer * lyr = llama_nvmoe_get_layer(nvmoe, il);
++        GGML_ASSERT(lyr != nullptr && "nvmoe: MoE layer missing from pack manifest");
++        GGML_ASSERT(up_exps_s == nullptr && gate_exps_s == nullptr && down_exps_s == nullptr &&
++                "nvmoe: per-expert weight scales not supported with paged experts");
++        GGML_ASSERT(arch != LLM_ARCH_GROVEMOE && "nvmoe: grovemoe id-division not supported with paged experts");
++
++        ids_mm = llama_nvmoe_ids_remap(ctx0, lyr, selected_experts);
++        cb(ids_mm, "ffn_moe_topk_nvmoe", il);
++
++        gate_exps = llama_nvmoe_pool(lyr, LLAMA_NVMOE_GATE);
++        up_exps   = llama_nvmoe_pool(lyr, LLAMA_NVMOE_UP);
++        down_exps = llama_nvmoe_pool(lyr, LLAMA_NVMOE_DOWN);
++        GGML_ASSERT(up_exps != nullptr && down_exps != nullptr);
++    }
++
+     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
+         // TODO: Use scalar div instead when/if implemented
+         ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
+@@ -1984,7 +2008,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         cb(up, "ffn_moe_up", il);
+     } else {
+         // separate gate and up path
+-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
++        up = build_lora_mm_id(up_exps, cur, ids_mm, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+         cb(up, "ffn_moe_up", il);
+ 
+         if (up_exps_s) {
+@@ -1997,7 +2021,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         }
+ 
+         if (gate_exps) {
+-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
++            cur = build_lora_mm_id(gate_exps, cur, ids_mm, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+             cb(cur, "ffn_moe_gate", il);
+         } else {
+             cur = up;
+@@ -2086,7 +2110,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             GGML_ABORT("fatal error");
+     }
+ 
+-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
++    experts = build_lora_mm_id(down_exps, cur, ids_mm, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+     cb(experts, "ffn_moe_down", il);
+ 
+     if (down_exps_s) {
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 4b5b75c..56904a1 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -18,6 +18,8 @@ struct ggml_tensor;
+ 
+ struct llama_cparams;
+ struct llama_layer;
++struct llama_nvmoe_context;
++struct llama_nvmoe_layer;
+ 
+ struct llama_memory_context_i;
+ 
+@@ -701,6 +703,9 @@ struct llm_graph_params {
+ 
+     llm_graph_result * res;
+ 
++    // nvmoe: paged-expert runtime of the model (null unless loaded from a pack)
++    llama_nvmoe_context * nvmoe = nullptr;
++
+     // return true if the "other" params would result in a graph with the same topology as with the current params
+     //   having the same topology allows us to reuse the graph in some cases
+     bool allow_reuse(const llm_graph_params & other) const {
+@@ -913,6 +918,8 @@ struct llm_graph_context {
+ 
+     llm_graph_result * res;
+ 
++    llama_nvmoe_context * nvmoe = nullptr;
++
+     ggml_context * ctx0 = nullptr;
+     ggml_cgraph  * gf   = nullptr;
+ 
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index e07b0d2..d829bbb 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -812,6 +812,16 @@ llama_model_loader::llama_model_loader(
+         }
+     }
+ 
++    // nvmoe pack detection: the repacker stamps resident.gguf with these KVs
++    if (!fname.empty() && gguf_find_key(metadata, "nvmoe.pack.version") >= 0) {
++        const int kid = gguf_find_key(metadata, "nvmoe.pack.manifest");
++        nvmoe_pack     = true;
++        nvmoe_manifest = kid >= 0 ? gguf_get_val_str(metadata, kid) : "manifest.json";
++        const size_t sep = fname.find_last_of("/\\");
++        nvmoe_dir = sep == std::string::npos ? "." : fname.substr(0, sep);
++        LLAMA_LOG_INFO("%s: nvmoe pack detected, routed experts will be paged from %s/\n", __func__, nvmoe_dir.c_str());
++    }
++
+     if (!llama_mmap::SUPPORTED) {
+         LLAMA_LOG_WARN("%s: mmap is not supported on this platform\n", __func__);
+         use_mmap = false;
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index c476026..e3436d3 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -80,6 +80,12 @@ struct llama_model_loader {
+     bool check_tensors;
+     bool no_alloc;
+ 
++    // nvmoe: set when the GGUF is a pack's resident.gguf (routed-expert
++    // weights live in a sidecar experts.pack next to it)
++    bool        nvmoe_pack = false;
++    std::string nvmoe_dir;
++    std::string nvmoe_manifest;
++
+     llama_files files;
+     llama_ftype ftype;
+     llama_fver  fver;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index d58ebac..9d492f6 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -7,6 +7,7 @@
+ #include "llama-mmap.h"
+ #include "llama-cparams.h"
+ #include "llama-model-loader.h"
++#include "llama-nvmoe.h"
+ 
+ #include "llama-kv-cache.h"
+ #include "llama-kv-cache-iswa.h"
+@@ -1624,10 +1625,28 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         }
+     }
+ 
++    // nvmoe: stand up the paged-expert runtime (pools + cache + pack fd)
++    if (ml.nvmoe_pack) {
++        int64_t cache_bytes = 0; // default: all experts resident
++        if (const char * s = getenv("NVMOE_CACHE_MB")) {
++            cache_bytes = strtoll(s, nullptr, 10) * 1024 * 1024;
++        }
++        nvmoe.reset(llama_nvmoe_init(ml.nvmoe_dir, ml.nvmoe_manifest, cache_bytes));
++    }
++
+     return true;
+ }
+ 
+ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
++    // nvmoe: routed-expert weights are paged from the pack, not loaded;
++    // build_moe_ffn() substitutes the nvmoe pool tensors for the nullptrs
++    if (ml.nvmoe_pack && tn.suffix != nullptr && strcmp(tn.suffix, "weight") == 0 &&
++            (tn.tensor == LLM_TENSOR_FFN_GATE_EXPS ||
++             tn.tensor == LLM_TENSOR_FFN_UP_EXPS   ||
++             tn.tensor == LLM_TENSOR_FFN_DOWN_EXPS)) {
++        return nullptr;
++    }
++
+     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+     return ml.create_tensor(
+         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 4800d29..9daca20 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -17,6 +17,7 @@
+ struct llama_cparams;
+ struct llama_ubatch;
+ struct llama_model_loader;
++struct llama_nvmoe_context;
+ 
+ // available models
+ enum llm_type {
+@@ -623,6 +624,9 @@ struct llama_model {
+     // for keeping track of associated LoRA adapters
+     std::unordered_set<llama_adapter_lora *> loras;
+ 
++    // nvmoe: paged routed experts (set when loaded from an nvmoe pack)
++    std::unique_ptr<llama_nvmoe_context> nvmoe;
++
+     // statically allocated context for assigning
+     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
+ 
+diff --git a/src/llama-nvmoe.cpp b/src/llama-nvmoe.cpp
+new file mode 100644
+index 0000000..8ff09a6
+--- /dev/null
++++ b/src/llama-nvmoe.cpp
+@@ -0,0 +1,374 @@
++#include "llama-nvmoe.h"
++
++#include "llama-impl.h"
++
++#include <nlohmann/json.hpp>
++
++#include <fcntl.h>
++#include <unistd.h>
++
++#include <cerrno>
++#include <cinttypes>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <stdexcept>
++
++using json = nlohmann::ordered_json;
++
++static const char * llama_nvmoe_kind_names[LLAMA_NVMOE_KIND_COUNT] = {
++    "ffn_gate_exps",
++    "ffn_up_exps",
++    "ffn_down_exps",
++};
++
++llama_nvmoe_context::~llama_nvmoe_context() {
++    if (n_ref > 0) {
++        LLAMA_LOG_INFO("nvmoe: %" PRIu64 " expert refs, %" PRIu64 " misses (%.2f%% hit), %.1f MiB fetched, %.3f s fetch time\n",
++                n_ref, n_miss, 100.0 * (n_ref - n_miss) / n_ref,
++                n_bytes / 1024.0 / 1024.0, t_fetch_us / 1e6);
++    }
++    if (fd >= 0) {
++        close(fd);
++    }
++    free(bounce);
++}
++
++llama_nvmoe_context * llama_nvmoe_init(const std::string & pack_dir, const std::string & manifest_name, int64_t cache_bytes) {
++    auto ctx = std::make_unique<llama_nvmoe_context>();
++    ctx->dir = pack_dir;
++
++    const std::string manifest_path = pack_dir + "/" + manifest_name;
++
++    json m;
++    {
++        std::ifstream f(manifest_path);
++        if (!f) {
++            throw std::runtime_error("nvmoe: cannot open manifest " + manifest_path);
++        }
++        f >> m;
++    }
++
++    if (m.value("format", "") != "nvmoe-pack" || m.value("format_version", 0) != 1) {
++        throw std::runtime_error("nvmoe: unsupported pack format in " + manifest_path);
++    }
++
++    ctx->alignment     = m.value("alignment", 4096);
++    ctx->n_expert      = m["model"]["n_expert"].get<int32_t>();
++    ctx->n_expert_used = m["model"]["n_expert_used"].get<int32_t>();
++
++    const int n_layers_total = m["model"]["n_layers_total"].get<int>();
++    ctx->layers.resize(n_layers_total);
++
++    // per-layer geometry
++    for (const auto & [key, jl] : m["layers"].items()) {
++        const int il = std::stoi(key);
++        if (il < 0 || il >= n_layers_total) {
++            throw std::runtime_error("nvmoe: manifest layer index out of range");
++        }
++        auto lyr = std::make_unique<llama_nvmoe_layer>();
++        lyr->ctx = ctx.get();
++        lyr->il  = il;
++        lyr->group_bytes  = jl["group_bytes"].get<size_t>();
++        lyr->group_stride = jl["group_stride"].get<size_t>();
++        lyr->ext_off.assign(ctx->n_expert, 0);
++
++        for (const auto & [kname, jp] : jl["parts"].items()) {
++            int kind = -1;
++            for (int k = 0; k < LLAMA_NVMOE_KIND_COUNT; k++) {
++                if (kname == llama_nvmoe_kind_names[k]) {
++                    kind = k;
++                    break;
++                }
++            }
++            if (kind < 0) {
++                throw std::runtime_error("nvmoe: unknown part kind '" + kname + "' in manifest");
++            }
++            auto & p = lyr->parts[kind];
++            p.present     = true;
++            p.type        = (ggml_type) jp["ggml_type"].get<int>();
++            p.ne0         = jp["ne"][0].get<int64_t>();
++            p.ne1         = jp["ne"][1].get<int64_t>();
++            p.slice_bytes = jp["slice_bytes"].get<size_t>();
++            p.rel_off     = jp["rel_off"].get<size_t>();
++
++            // cross-check the manifest against ggml's own row math
++            const size_t row_bytes = ggml_row_size(p.type, p.ne0);
++            if (row_bytes * p.ne1 != p.slice_bytes) {
++                throw std::runtime_error("nvmoe: manifest slice_bytes mismatch for " + kname);
++            }
++        }
++        ctx->bounce_size = std::max(ctx->bounce_size, lyr->group_stride);
++        ctx->layers[il] = std::move(lyr);
++    }
++
++    // extent offsets
++    for (const auto & g : m["groups"]) {
++        const int      il = g[0].get<int>();
++        const int       e = g[1].get<int>();
++        const uint64_t off = g[2].get<uint64_t>();
++        if (il < 0 || il >= n_layers_total || !ctx->layers[il] || e < 0 || e >= ctx->n_expert) {
++            throw std::runtime_error("nvmoe: bad group entry in manifest");
++        }
++        ctx->layers[il]->ext_off[e] = off;
++    }
++
++    // geometry groups: layers whose parts all match share pools and cache slots
++    struct sig_entry {
++        llama_nvmoe_part parts[LLAMA_NVMOE_KIND_COUNT];
++        int group;
++        int n_layers;
++    };
++    std::vector<sig_entry> sigs;
++    for (auto & lyr : ctx->layers) {
++        if (!lyr) {
++            continue;
++        }
++        int found = -1;
++        for (auto & s : sigs) {
++            bool same = true;
++            for (int k = 0; k < LLAMA_NVMOE_KIND_COUNT && same; k++) {
++                const auto & a = s.parts[k];
++                const auto & b = lyr->parts[k];
++                same = a.present == b.present && a.type == b.type && a.ne0 == b.ne0 && a.ne1 == b.ne1;
++            }
++            if (same) {
++                found = s.group;
++                break;
++            }
++        }
++        if (found < 0) {
++            found = (int) sigs.size();
++            sig_entry s = {};
++            memcpy(s.parts, lyr->parts, sizeof(s.parts));
++            s.group    = found;
++            s.n_layers = 0;
++            sigs.push_back(s);
++        }
++        sigs[found].n_layers++;
++        lyr->group = found;
++    }
++
++    // slot budget: default everything resident; with a byte budget, split it
++    // across groups proportionally to their share of the paged bytes, floored
++    // at n_expert slots so any single mul_mat_id fits in its group's pool
++    size_t total_paged = 0;
++    std::vector<size_t> group_paged(sigs.size(), 0);
++    for (auto & lyr : ctx->layers) {
++        if (!lyr) {
++            continue;
++        }
++        group_paged[lyr->group] += lyr->group_bytes * ctx->n_expert;
++        total_paged             += lyr->group_bytes * ctx->n_expert;
++    }
++
++    ctx->groups.resize(sigs.size());
++    for (auto & s : sigs) {
++        auto & g = ctx->groups[s.group];
++
++        // bytes of one slot = one expert's extent payload (uniform within a group)
++        size_t slot_bytes = 0;
++        for (int k = 0; k < LLAMA_NVMOE_KIND_COUNT; k++) {
++            if (s.parts[k].present) {
++                slot_bytes += s.parts[k].slice_bytes;
++            }
++        }
++
++        const int64_t all_slots = (int64_t) s.n_layers * ctx->n_expert;
++        int64_t n_slots = all_slots;
++        if (cache_bytes > 0) {
++            const int64_t budget = (int64_t) ((double) cache_bytes * group_paged[s.group] / total_paged);
++            n_slots = std::min<int64_t>(all_slots, std::max<int64_t>(ctx->n_expert, budget / (int64_t) slot_bytes));
++        }
++        g.n_slots = (int32_t) n_slots;
++
++        g.slot_key .assign(g.n_slots, -1);
++        g.slot_used.assign(g.n_slots,  0);
++        g.slot_op  .assign(g.n_slots,  0);
++    }
++
++    // pool tensors, allocated in one CPU buffer
++    {
++        const size_t n_pools = sigs.size() * LLAMA_NVMOE_KIND_COUNT;
++        ggml_init_params ip = {
++            /*.mem_size   =*/ ggml_tensor_overhead() * n_pools,
++            /*.mem_buffer =*/ nullptr,
++            /*.no_alloc   =*/ true,
++        };
++        ctx->ctx_pools.reset(ggml_init(ip));
++        if (!ctx->ctx_pools) {
++            throw std::runtime_error("nvmoe: failed to create pool context");
++        }
++
++        for (auto & s : sigs) {
++            auto & g = ctx->groups[s.group];
++            for (int k = 0; k < LLAMA_NVMOE_KIND_COUNT; k++) {
++                if (!s.parts[k].present) {
++                    continue;
++                }
++                ggml_tensor * t = ggml_new_tensor_3d(ctx->ctx_pools.get(), s.parts[k].type, s.parts[k].ne0, s.parts[k].ne1, g.n_slots);
++                ggml_format_name(t, "nvmoe_pool_g%d.%s", s.group, llama_nvmoe_kind_names[k]);
++                g.pool[k] = t;
++            }
++        }
++
++        ctx->buf_pools.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx->ctx_pools.get(), ggml_backend_cpu_buffer_type()));
++        if (!ctx->buf_pools) {
++            throw std::runtime_error("nvmoe: failed to allocate pool buffers");
++        }
++        ggml_backend_buffer_set_usage(ctx->buf_pools.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++
++        LLAMA_LOG_INFO("nvmoe: %zu pool group(s), %8.2f MiB expert cache (%s)\n",
++                sigs.size(), ggml_backend_buffer_get_size(ctx->buf_pools.get()) / 1024.0 / 1024.0,
++                cache_bytes > 0 ? "budgeted" : "all experts resident");
++    }
++
++    // pack file + bounce buffer
++    {
++        const std::string pack_path = pack_dir + "/" + m["files"]["expert_pack"].get<std::string>();
++
++        const bool no_direct = getenv("NVMOE_NO_DIRECT") != nullptr;
++        if (!no_direct) {
++            ctx->fd = open(pack_path.c_str(), O_RDONLY | O_DIRECT);
++            ctx->direct_io = ctx->fd >= 0;
++        }
++        if (ctx->fd < 0) {
++            ctx->fd = open(pack_path.c_str(), O_RDONLY);
++        }
++        if (ctx->fd < 0) {
++            throw std::runtime_error("nvmoe: cannot open pack " + pack_path + ": " + strerror(errno));
++        }
++
++        if (posix_memalign(&ctx->bounce, ctx->alignment, ctx->bounce_size) != 0) {
++            throw std::runtime_error("nvmoe: failed to allocate bounce buffer");
++        }
++
++        // header read is one aligned block, so it works under O_DIRECT too
++        if (pread(ctx->fd, ctx->bounce, ctx->alignment, 0) != (ssize_t) ctx->alignment) {
++            throw std::runtime_error("nvmoe: cannot read pack header");
++        }
++        if (memcmp(ctx->bounce, "NVMOEPK1", 8) != 0) {
++            throw std::runtime_error("nvmoe: bad pack magic in " + pack_path);
++        }
++
++        LLAMA_LOG_INFO("nvmoe: pack %s opened (O_DIRECT %s)\n", pack_path.c_str(), ctx->direct_io ? "on" : "off");
++    }
++
++    return ctx.release();
++}
++
++llama_nvmoe_layer * llama_nvmoe_get_layer(const llama_nvmoe_context * ctx, int il) {
++    if (il < 0 || (size_t) il >= ctx->layers.size()) {
++        return nullptr;
++    }
++    return ctx->layers[il].get();
++}
++
++ggml_tensor * llama_nvmoe_pool(const llama_nvmoe_layer * lyr, llama_nvmoe_kind kind) {
++    return lyr->ctx->groups[lyr->group].pool[kind];
++}
++
++// fetch one expert's extent from the pack and scatter its parts into slot
++static void llama_nvmoe_fetch(llama_nvmoe_layer * lyr, int32_t expert, int32_t slot) {
++    llama_nvmoe_context * nc = lyr->ctx;
++    llama_nvmoe_group   & g  = nc->groups[lyr->group];
++
++    const int64_t t0 = ggml_time_us();
++
++    const uint64_t off = lyr->ext_off[expert];
++    size_t done = 0;
++    while (done < lyr->group_stride) {
++        const ssize_t r = pread(nc->fd, (char *) nc->bounce + done, lyr->group_stride - done, off + done);
++        if (r <= 0) {
++            GGML_ABORT("nvmoe: pack read failed at offset %" PRIu64 ": %s", off + done, r == 0 ? "eof" : strerror(errno));
++        }
++        done += r;
++    }
++
++    for (int k = 0; k < LLAMA_NVMOE_KIND_COUNT; k++) {
++        const auto & p = lyr->parts[k];
++        if (!p.present) {
++            continue;
++        }
++        ggml_tensor * pool = g.pool[k];
++        memcpy((char *) pool->data + (size_t) slot * pool->nb[2], (const char *) nc->bounce + p.rel_off, p.slice_bytes);
++    }
++
++    nc->n_bytes    += lyr->group_stride;
++    nc->t_fetch_us += ggml_time_us() - t0;
++}
++
++// the custom op: for every selected expert id, make sure the expert is
++// resident in the pool and write out its slot index
++static void llama_nvmoe_fetch_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
++    GGML_UNUSED(nth);
++    if (ith != 0) {
++        return;
++    }
++
++    GGML_ASSERT(a->type == GGML_TYPE_I32 && ggml_is_contiguous(a));
++
++    llama_nvmoe_layer   * lyr = (llama_nvmoe_layer *) userdata;
++    llama_nvmoe_context * nc  = lyr->ctx;
++    llama_nvmoe_group   & g   = nc->groups[lyr->group];
++
++    nc->epoch++;
++
++    const int64_t n = ggml_nelements(a);
++    const int32_t * ids = (const int32_t *) a->data;
++    int32_t       * out = (int32_t *) dst->data;
++
++    for (int64_t i = 0; i < n; i++) {
++        const int32_t e = ids[i];
++        GGML_ASSERT(e >= 0 && e < nc->n_expert);
++
++        const int64_t key = ((int64_t) lyr->il << 32) | (uint32_t) e;
++
++        int32_t slot;
++        const auto it = g.where.find(key);
++        if (it != g.where.end()) {
++            slot = it->second;
++        } else {
++            nc->n_miss++;
++
++            // victim: first empty slot, else LRU among slots not pinned by this op
++            slot = -1;
++            uint64_t best = UINT64_MAX;
++            for (int32_t s = 0; s < g.n_slots; s++) {
++                if (g.slot_key[s] < 0) {
++                    slot = s;
++                    break;
++                }
++                if (g.slot_op[s] != nc->epoch && g.slot_used[s] < best) {
++                    best = g.slot_used[s];
++                    slot = s;
++                }
++            }
++            if (slot < 0) {
++                GGML_ABORT("nvmoe: expert cache too small for a single op (n_slots = %d)", g.n_slots);
++            }
++            if (g.slot_key[slot] >= 0) {
++                g.where.erase(g.slot_key[slot]);
++            }
++
++            llama_nvmoe_fetch(lyr, e, slot);
++
++            g.slot_key[slot] = key;
++            g.where[key]     = slot;
++        }
++
++        nc->n_ref++;
++        g.slot_used[slot] = ++nc->tick;
++        g.slot_op[slot]   = nc->epoch;
++
++        out[i] = slot;
++    }
++}
++
++ggml_tensor * llama_nvmoe_ids_remap(ggml_context * ctx0, llama_nvmoe_layer * lyr, ggml_tensor * selected_experts) {
++    // selected_experts is usually a strided view (argsort_top_k); the op wants flat i32
++    if (!ggml_is_contiguous(selected_experts)) {
++        selected_experts = ggml_cont(ctx0, selected_experts);
++    }
++    return ggml_map_custom1(ctx0, selected_experts, llama_nvmoe_fetch_op, 1, lyr);
++}
+diff --git a/src/llama-nvmoe.h b/src/llama-nvmoe.h
+new file mode 100644
+index 0000000..f0c638b
+--- /dev/null
++++ b/src/llama-nvmoe.h
+@@ -0,0 +1,121 @@
++#pragma once
++
++// nvmoe: paged routed experts
++//
++// When a model is loaded from an nvmoe pack (see nvmoe's docs/PACK_FORMAT.md),
++// the routed-expert weights are not loaded into memory at all. Instead:
++//
++//   - resident.gguf goes through the normal loader minus the
++//     blk.*.ffn_{gate,up,down}_exps.weight tensors
++//   - this module owns fixed-size "pool" tensors [ne0, ne1, n_slots] per
++//     matrix kind, shared by all MoE layers with the same geometry, backed by
++//     an LRU cache keyed (layer, expert) -> slot
++//   - build_moe_ffn() inserts a custom op on the selected-experts ids that
++//     fetches missing experts from experts.pack (synchronous O_DIRECT read on
++//     miss) and emits ids remapped to pool slots, so ggml_mul_mat_id runs
++//     unchanged on the pool tensors
++//
++// State lives on the llama_model; one llama_context per model at a time (the
++// custom op mutates the cache with no locking across contexts).
++
++#include "ggml.h"
++#include "ggml-backend.h"
++#include "ggml-cpp.h"
++
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++enum llama_nvmoe_kind {
++    LLAMA_NVMOE_GATE = 0,
++    LLAMA_NVMOE_UP   = 1,
++    LLAMA_NVMOE_DOWN = 2,
++    LLAMA_NVMOE_KIND_COUNT,
++};
++
++struct llama_nvmoe_context;
++
++// one matrix kind of one layer, as described by the pack manifest
++struct llama_nvmoe_part {
++    bool      present = false;
++    ggml_type type    = GGML_TYPE_COUNT;
++    int64_t   ne0     = 0;
++    int64_t   ne1     = 0;
++    size_t    slice_bytes = 0; // bytes of one expert's matrix
++    size_t    rel_off     = 0; // offset inside the extent
++};
++
++struct llama_nvmoe_layer {
++    llama_nvmoe_context * ctx = nullptr;
++
++    int il    = -1;
++    int group = -1; // index into llama_nvmoe_context::groups
++
++    llama_nvmoe_part parts[LLAMA_NVMOE_KIND_COUNT];
++
++    size_t group_bytes  = 0; // payload bytes per extent
++    size_t group_stride = 0; // padded to pack alignment
++
++    std::vector<uint64_t> ext_off; // absolute pack offset per expert
++};
++
++// layers with identical part geometry share pool tensors and cache slots
++struct llama_nvmoe_group {
++    ggml_tensor * pool[LLAMA_NVMOE_KIND_COUNT] = {};
++
++    int32_t n_slots = 0;
++
++    // cache state; key = (layer << 32) | expert
++    std::vector<int64_t>  slot_key;  // -1 = empty
++    std::vector<uint64_t> slot_used; // last-use tick (LRU)
++    std::vector<uint64_t> slot_op;   // op epoch that pinned the slot
++    std::unordered_map<int64_t, int32_t> where;
++};
++
++struct llama_nvmoe_context {
++    std::string dir;
++
++    int    fd        = -1;
++    bool   direct_io = false;
++    size_t alignment = 4096;
++
++    int32_t n_expert      = 0;
++    int32_t n_expert_used = 0;
++
++    std::vector<std::unique_ptr<llama_nvmoe_layer>> layers; // indexed by il, null for non-MoE layers
++    std::vector<llama_nvmoe_group> groups;
++
++    // pool tensor storage (host memory in the CPU correctness path)
++    ggml_context_ptr           ctx_pools;
++    ggml_backend_buffer_ptr    buf_pools;
++
++    // O_DIRECT-aligned bounce buffer, large enough for the largest extent
++    void * bounce      = nullptr;
++    size_t bounce_size = 0;
++
++    uint64_t tick  = 0; // LRU clock
++    uint64_t epoch = 0; // custom-op invocation counter (for per-op pinning)
++
++    // stats, counted per expert reference (top_k * n_tokens per layer op)
++    uint64_t n_ref   = 0;
++    uint64_t n_miss  = 0;
++    uint64_t n_bytes = 0;  // bytes fetched from the pack
++    int64_t  t_fetch_us = 0;
++
++    ~llama_nvmoe_context();
++};
++
++// load manifest + open pack; cache_bytes <= 0 means "all experts resident".
++// throws std::runtime_error on any problem.
++llama_nvmoe_context * llama_nvmoe_init(const std::string & pack_dir, const std::string & manifest_name, int64_t cache_bytes);
++
++// per-layer handle for graph building; null if il is not a paged MoE layer
++llama_nvmoe_layer * llama_nvmoe_get_layer(const llama_nvmoe_context * ctx, int il);
++
++// pool tensor for a kind; null if the arch has no such matrix
++ggml_tensor * llama_nvmoe_pool(const llama_nvmoe_layer * lyr, llama_nvmoe_kind kind);
++
++// build-time: wrap selected_experts in the fetch+remap custom op
++ggml_tensor * llama_nvmoe_ids_remap(ggml_context * ctx0, llama_nvmoe_layer * lyr, ggml_tensor * selected_experts);

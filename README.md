@@ -79,6 +79,26 @@ Measured on the reference models: OLMoE-1B-7B (Q4_0) → 1,024 extents of
 0.000% alignment padding, and the repack runs in seconds to tens of seconds.
 Format spec: [docs/PACK_FORMAT.md](docs/PACK_FORMAT.md).
 
+### Optional: run a model from its pack (Phase 2.3, CPU so far)
+
+The `runtime/` patch series teaches llama.cpp to load a pack directly — the
+routed experts are fetched from `experts.pack` on demand instead of loaded:
+
+```bash
+./runtime/apply.sh && cd llama.cpp-nvmoe
+cmake -B build && cmake --build build -j --target llama-nvmoe-logits llama-bench
+
+# any tool, no new flags -- the pack is detected from resident.gguf's metadata
+./build/bin/llama-bench -m ../models/olmoe-q4_0.nvmoe/resident.gguf -p 16 -n 32
+NVMOE_CACHE_MB=512 ./build/bin/llama-bench -m ...    # cap the expert cache
+```
+
+The correctness bar is the strongest one available: **bit-identical logits
+vs stock llama.cpp**, verified over dozens of greedy-decode steps on both
+reference packs, including under heavy cache eviction. Reproduce it with the
+commands in [runtime/README.md](runtime/README.md); how the integration
+works is in [docs/INTEGRATION.md](docs/INTEGRATION.md).
+
 ## Measured results (reproducible with the commands above)
 
 **NVMe delivers.** Samsung 990 PRO (PCIe 4.0 x4), O_DIRECT random reads at expert-sized blocks: 4.4 GB/s at 2MB/QD1 rising to ~6-7 GB/s at 9MB+, ~8 GB/s at 2MB/QD4. Expert-granular random access costs almost nothing vs sequential.
@@ -119,7 +139,9 @@ Prefill is the known weak spot: a long prompt touches nearly every expert (~18s 
   - [x] **2.1 offline repacker** (`tools/repack_gguf.py`): any MoE GGUF → resident GGUF + per-expert 4KB-aligned extents + manifest ([format spec](docs/PACK_FORMAT.md)); proven byte-lossless on OLMoE-1B-7B and Qwen3-30B-A3B via `tools/verify_pack.py`
   - [x] **2.2a io_uring extent reader** (`paging/`): raw-syscall io_uring + O_DIRECT benchmark on real packs — 0.7ms per expert miss, ~7GB/s @ QD2
   - [x] **2.2b NVMe→VRAM end-to-end** (`--gpu`): pinned staging + async H2D into a VRAM slab, byte-verified — the GPU hop costs 2-5%; ~6.6GB/s / ~2,300 experts/s to VRAM on ~220MB of host RAM. No CUDA toolkit needed (driver API via dlopen)
-  - [ ] 2.3 llama.cpp integration: synchronous fetch-on-miss first (identical logits vs stock as the gate), then router-guided prefetch
+  - [x] **2.3a llama.cpp integration, CPU correctness** (`runtime/`): pack loading + expert-cache pools + sync fetch-on-miss behind an unchanged `ggml_mul_mat_id`; gate = **bit-identical logits vs stock** on OLMoE-1B-7B and Qwen3-30B-A3B, including under heavy cache eviction ([how it hooks in](docs/INTEGRATION.md))
+  - [ ] 2.3b GPU path: expert pools in VRAM, fetches via the measured 2.2b pipeline; same logits gate on the CUDA backend
+  - [ ] 2.3c router-guided prefetch at QD 2-4, overlapped with compute
   - [ ] 2.4 measured tok/s vs stock full-VRAM on Qwen3-30B-A3B, then GPT-OSS-120B
 - [ ] **Phase 3 — planner**: probe hardware, read GGUF metadata, emit the optimal quant + placement plan per model automatically
 - [ ] **Stunt flag**: DeepSeek-R1 671B, 16GB VRAM, ≤4GB RAM, on video
@@ -132,6 +154,8 @@ sim/            cache simulator: presets.py, trace_gen.py, cache_sim.py,
 paging/         Phase 2 paging library: nvmoe_iobench.c (io_uring extent-fetch
                 + NVMe→VRAM benchmark; raw syscalls + dlopen'd CUDA driver
                 API, no deps) + measured results
+runtime/        the llama.cpp exps=NVMe patch series + apply.sh (Phase 2.3)
+                and the identical-logits gate procedure
 collector/      llama.cpp trace tool (nvmoe-trace.cpp) + install.sh
 tools/          repack_gguf.py + verify_pack.py (GGUF → expert pack, Phase 2),
                 gguf_lite.py (stdlib GGUF reader/writer),
@@ -141,6 +165,7 @@ tests/          test_repack.py — full repack round-trip on a synthetic tiny
 prompts/        the four standard trace workloads (ChatML format)
 traces/         real routing traces (*.tokens.jsonl committed as samples)
 docs/           DESIGN.md (architecture), PACK_FORMAT.md (expert pack spec),
+                INTEGRATION.md (llama.cpp hook points),
                 TRACE_COLLECTION.md (how tracing works)
 ```
 
