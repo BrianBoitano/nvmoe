@@ -45,7 +45,7 @@ expert extents on NVMe           │  KV cache                    │
  friendly alignment)             └──────▲───────────────────────┘
      │                                  │ cudaMemcpyAsync (H2D)
      ▼                                  │
-io_uring reader (QD 16-32) ──► pinned staging ring (≤4GB) ──────┘
+io_uring reader (QD 2-8)  ──► pinned staging ring (≤4GB) ──────┘
      ▲
      │ fetch queue
 router-guided prefetcher (layer L router output + cross-layer
@@ -77,6 +77,10 @@ k layers ahead so I/O overlaps attention/dense compute)
    saturate the SSD at expert-sized reads (1.8-13MB in target models — large
    enough to get near-sequential throughput). Page cache is bypassed
    deliberately: it would silently consume the RAM we promised not to take.
+   Measured (paging/, Phase 2.2a): at 2.5-3.4MB extents the sweet spot is
+   shallow — ~7GB/s at QD2, and throughput *drops* past QD4 while latency
+   grows linearly. Multi-MB reads are already parallel inside the device;
+   the prefetcher should keep 2-4 in flight, not 16-32 as first guessed.
 
 5. **Runtime integration.** Fork/patch llama.cpp: introduce an `exps=NVMe`
    placement in the `--override-tensor` machinery. The MoE FFN path
