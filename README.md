@@ -36,6 +36,9 @@ python3 sim/run_sim.py --model gpt-oss-120b --vram-gb 24 --nvme-gbps 12
 
 # 3. Measure YOUR SSD at expert-sized reads (Linux; point it at any large file on the drive)
 python3 tools/nvme_probe.py /path/to/any/big/file
+
+# 4. Plan a specific model on your hardware (reads the GGUF's MoE geometry)
+python3 tools/plan.py /path/to/model.gguf --vram-gb 16 --nvme-gbps 7
 ```
 
 Step 3's output is the honest version of your SSD's spec sheet: O_DIRECT random reads at 2-99MB blocks, the exact I/O pattern the runtime will use. Feed the result back into step 2 via `--nvme-gbps`.
@@ -79,7 +82,7 @@ Measured on the reference models: OLMoE-1B-7B (Q4_0) → 1,024 extents of
 0.000% alignment padding, and the repack runs in seconds to tens of seconds.
 Format spec: [docs/PACK_FORMAT.md](docs/PACK_FORMAT.md).
 
-### Optional: run a model from its pack (Phase 2.3, CPU so far)
+### Optional: run a model from its pack (Phase 2.3)
 
 The `runtime/` patch series teaches llama.cpp to load a pack directly — the
 routed experts are fetched from `experts.pack` on demand instead of loaded:
@@ -98,6 +101,32 @@ vs stock llama.cpp**, verified over dozens of greedy-decode steps on both
 reference packs, including under heavy cache eviction. Reproduce it with the
 commands in [runtime/README.md](runtime/README.md); how the integration
 works is in [docs/INTEGRATION.md](docs/INTEGRATION.md).
+
+### The planner: will *your* model run, and how fast? (Phase 3)
+
+`tools/plan.py` turns everything this repo measured into an answer for a
+model it has never seen. Give it a GGUF (it reads the MoE geometry directly)
+and your hardware numbers; it checks whether the model just fits (then use
+stock llama.cpp — paging costs ~13% when you don't need it), checks the
+thrash-cliff floor, picks the routing-family hit curve by architecture,
+and prints the expected decode range plus every command to get there:
+
+```bash
+python3 tools/plan.py models/qwen3-30b-a3b-q4_k_m.gguf                # a real file
+python3 tools/plan.py --preset deepseek-r1-671b                       # not downloaded yet
+python3 tools/plan.py model.gguf --vram-gb 24 --nvme-gbps 12          # your box
+python3 tools/plan.py --postdict                                      # its receipts
+```
+
+`--postdict` is the honesty check: the planner re-predicts the eight
+configurations measured in [runtime/README.md](runtime/README.md) and prints
+predicted vs measured side by side. Its hit-rate model lands within a few
+points of live runtime counters on real prompts; measured `llama-bench`
+decode lands 0.7-2.1x of the predicted tok/s, and the tail is systematic —
+`-p 0` benchmark generation routes far more repetitively than real
+workloads, most of all on flat-routing DeepSeek-family models. The planner
+predicts real use, not benchmark flattery, and reports that spread as its
+error bars.
 
 ## Measured results (reproducible with the commands above)
 
@@ -121,6 +150,8 @@ works is in [docs/INTEGRATION.md](docs/INTEGRATION.md).
 Top-10% of experts carry 34.7% of routing traffic; consecutive tokens reuse 43.4% of their expert set. On a 16GB card, Qwen3-30B-A3B's cache holds 83% of its experts → **99.6% hit rate**: a model that doesn't fit in VRAM becomes effectively VRAM-resident.
 
 **...but routing flatness is an architecture property.** The same four-workload trace on DeepSeek-V2-Lite (26 layers, 64 experts, top-6 — the small proxy for R1-style fine-grained routing) tells a different story: top-10% experts carry only **17.7%** of traffic, consecutive tokens reuse just **24.2%** of their experts, and the LRU curve sits roughly half as high — 23.2% hits at a 10% cache and 40.6% at 25% (vs Qwen3's 48.2% / 81.4%). Calibrated `zipf_s` drops from ~1.0 to 0.3. DeepSeek-family models pay for their fine granularity with much flatter routing: they need proportionally more cache for the same hit rate, and any R1-class plan must budget with these curves, not Qwen3's.
+
+**GPT-OSS-120B is the opposite extreme — and it explains the 2.2x.** Its four-workload trace (collected at full speed on the GPU *through the pack*, since a 63GB model can't be traced on CPU — see [docs/TRACE_COLLECTION.md](docs/TRACE_COLLECTION.md)) measures top-10% experts carrying **56.7%** of traffic and **50.4%** token-to-token overlap — the most cacheable routing of the three families, well beyond Qwen3's. That is why its measured 24.5 tok/s beat the synthetic simulator's ~11 ceiling by 2.2x: top-4-of-128 routing at only 36 layers is heavily concentrated in practice.
 
 **The thrash cliff.** A cache smaller than one token's active set (`moe_layers x top_k / total_experts` — 6.3% for Qwen3-30B, 9.4% for V2-Lite, only 3.1% for R1's fine-grained 256-expert design) hits exactly 0% — the V2-Lite trace confirms it on a second architecture (0.0% at a 5% cache). Fine-grained MoE has lower cliffs; any placement planner must check this floor first.
 
@@ -151,7 +182,7 @@ Prefill is the known weak spot: a long prompt touches nearly every expert (~18s 
   - [x] **2.3c(ii) router-logit lookahead prefetch**: predict layer L+1's experts from layer L's hidden state (one folded matmul per layer — **~86% of routed ids at top-8**, measured) and fetch them during L's compute via a priority fetch pool; +4-7% decode at fetch-bound budgets, auto-off near-resident, still bit-identical. The offline-table alternative was evaluated against real traces and rejected (`tools/analyze_lookahead.py`)
   - [x] **2.4 measured tok/s on Qwen3-30B-A3B** ([tables + commands](runtime/README.md)): **166 tok/s decode from the pack at a 12GB VRAM cache — 2.1x the best stock offload split, 3.7x the exps-in-RAM recipe — with 756MB peak host RAM, proven inside a hard 4GB cgroup.**
   - [x] **2.4b GPT-OSS-120B** ([tables + commands](runtime/README.md)): a 63GB model on the 16GB card — **24.5 tok/s decode at an 11GB cache, ~3x the best stock attempt, inside a 4GB cgroup**; the sweep (10.5/18.7/24.5 at 4/8/11GB) tracks the hit-rate curves, and its 12.6MB extents produced the extent-size speculation gate (wasted prefetch guesses cost more than they hide on fetch-bound decode)
-- [ ] **Phase 3 — planner**: probe hardware, read GGUF metadata, emit the optimal quant + placement plan per model automatically
+- [x] **Phase 3 — planner** (`tools/plan.py`): reads any MoE GGUF's geometry, takes your VRAM/SSD numbers, and emits the placement plan — cache budget, prefetch setting, expected decode range, and the exact repack/verify/gate/bench commands. Validated by postdiction: `--postdict` reprints its predictions against all eight measured configurations (0.7-2x, with the systematic direction explained there)
 - [ ] **Stunt flag**: DeepSeek-R1 671B, 16GB VRAM, ≤4GB RAM, on video
 
 ## Repo map
@@ -165,7 +196,10 @@ paging/         Phase 2 paging library: nvmoe_iobench.c (io_uring extent-fetch
 runtime/        the llama.cpp exps=NVMe patch series + apply.sh (Phase 2.3)
                 and the identical-logits gate procedure
 collector/      llama.cpp trace tool (nvmoe-trace.cpp) + install.sh
-tools/          repack_gguf.py + verify_pack.py (GGUF → expert pack, Phase 2),
+tools/          plan.py (Phase 3 planner: GGUF + your hardware → placement
+                plan, expected tok/s, and the commands; --postdict validates
+                it against every measured configuration),
+                repack_gguf.py + verify_pack.py (GGUF → expert pack, Phase 2),
                 gguf_lite.py (stdlib GGUF reader/writer),
                 nvme_probe.py (SSD bench), collect_qwen_traces.sh
 tests/          test_repack.py — full repack round-trip on a synthetic tiny
@@ -185,7 +219,7 @@ docs/           DESIGN.md (architecture), PACK_FORMAT.md (expert pack spec),
 
 **Will 1.58-bit quality be terrible?** 1.58-bit is the stunt tier and shows real degradation. 3-4 bit dynamic quants hold up well in public benchmarks (3-bit DeepSeek V3.1 scored 75.6% vs 76.1% unquantized on Aider Polyglot). The runtime is quant-agnostic; it pages whatever GGUF you give it.
 
-**Can I run this today?** The simulator, SSD probe, trace collector, and the expert-pack repacker: yes, today — that's Phases 0-1 and the first piece of Phase 2. The paging runtime itself is under active development. Star/watch the repo if you want the moment it lands.
+**Can I run this today?** Yes. The simulator, SSD probe, trace collector, repacker, planner, and the paging runtime itself (as a patch series against a pinned llama.cpp commit — `runtime/apply.sh`) all work today; every number above has a reproduce command. What remains on the roadmap is the R1-671B stunt run.
 
 **Windows/macOS?** The simulator runs anywhere Python does. The NVMe probe and the planned runtime are Linux-first (io_uring, O_DIRECT). macOS unified memory largely doesn't need this; Windows support would need a different I/O backend.
 
