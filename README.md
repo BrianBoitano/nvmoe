@@ -82,6 +82,13 @@ Measured on the reference models: OLMoE-1B-7B (Q4_0) → 1,024 extents of
 0.000% alignment padding, and the repack runs in seconds to tens of seconds.
 Format spec: [docs/PACK_FORMAT.md](docs/PACK_FORMAT.md).
 
+### Optional: chat with a model from its pack
+
+The pack serves as a local OpenAI-compatible endpoint like any GGUF —
+`llama-server -m <pack>/resident.gguf -ngl 99` and point your chat UI at
+it ([details](runtime/README.md)). On the reference box the 80B pack
+answers through the API at ~30 tok/s, prefill included.
+
 ### Optional: run a model from its pack (Phase 2.3)
 
 The `runtime/` patch series teaches llama.cpp to load a pack directly — the

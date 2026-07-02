@@ -110,9 +110,19 @@ Two things we learned the hard way, kept here so nobody re-learns them:
   attention at `-ngl 14`). The gate tool sets `op_offload = false` on
   both sides, same rationale as `use_extra_bufts`.
 
-Known quirk, not yet chased: upstream's `llama-eval-callback` example
-segfaults on a pack model (our own dump mode in `llama-nvmoe-logits -d`
-does the same job and works).
+Resolved quirk (was: "`llama-eval-callback` segfaults on packs,
+unexplained"): every tool built on `common_init_from_params` — that's
+`llama-server`, `llama-cli`, `llama-eval-callback` — runs a memory-estimate
+pass (`common_fit_params`) that loads the model with
+`llama_model_params.no_alloc` and builds a graph without loading weights.
+Pack mode nulled the expert tensors but the nvmoe runtime only initialized
+after weight load, so the estimate graph dereferenced null pool tensors.
+The runtime now initializes in no_alloc mode too: pool tensors exist on
+dummy buffers (the same trick `load_tensors` uses for weights) so graphs
+build, but no pack fd, no bounce buffer, no fetch workers, no lookahead.
+One honest limitation: the memory estimate does not yet count the expert
+cache, so `--fit` may size the context optimistically — set `-c` (and
+`NVMOE_CACHE_MB`) explicitly when VRAM is tight.
 
 ## The lookahead prefetcher (fourth patch)
 

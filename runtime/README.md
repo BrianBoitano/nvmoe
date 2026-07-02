@@ -27,6 +27,28 @@ detected from its `nvmoe.pack.version` KV.
 NVMOE_CACHE_MB=512 ./build/bin/llama-bench -m ...   # cap the expert cache
 ```
 
+## Chat with it: llama-server
+
+The pack works as a local OpenAI-compatible chat server — this is the
+"actually use the model" path (build the `llama-server` target; the cmake
+configure needs `-DLLAMA_BUILD_SERVER=ON` if it wasn't on):
+
+```bash
+NVMOE_CACHE_MB=11776 ./build-cuda/bin/llama-server \
+    -m models/qwen3-next-80b-a3b-instruct-q4_k_m.nvmoe/resident.gguf \
+    -ngl 99 -c 16384 --host 0.0.0.0 --port 8901
+curl http://localhost:8901/v1/chat/completions -H "Content-Type: application/json" \
+    -d '{"messages":[{"role":"user","content":"hello"}]}'
+```
+
+Point Open WebUI (or anything OpenAI-compatible) at `http://<host>:8901/v1`.
+Measured on the reference box: the 80B pack streams ~150 tokens in ~5s
+through the API, prefill included. Use `NVMOE_CACHE_MB` to leave VRAM for
+the KV cache at your `-c`; the server's `--fit` estimate does not yet count
+the expert cache (see docs/INTEGRATION.md), so size those two explicitly.
+One `llama_context` per pack model still applies — the default single
+server process is exactly that.
+
 ## Lookahead prefetch (the fourth patch)
 
 At small cache budgets decode is fetch-bound, so the runtime predicts the
