@@ -83,7 +83,7 @@ Format spec: [docs/PACK_FORMAT.md](docs/PACK_FORMAT.md).
 
 **NVMe delivers.** Samsung 990 PRO (PCIe 4.0 x4), O_DIRECT random reads at expert-sized blocks: 4.4 GB/s at 2MB/QD1 rising to ~6-7 GB/s at 9MB+, ~8 GB/s at 2MB/QD4. Expert-granular random access costs almost nothing vs sequential.
 
-**A cache miss costs ~0.7ms.** io_uring + O_DIRECT random extent fetches from real repacked expert packs (`paging/nvmoe-iobench`): p50 0.7ms / p99 <1ms per expert at QD1, peaking at **~7 GB/s and ~2,400 experts/s at QD2** — the bandwidth number the simulator's ceilings assume, confirmed on the real file with the real access pattern. Throughput *falls* past QD4 (multi-MB reads are already parallel inside the SSD), so the prefetcher design keeps 2-4 reads in flight, not the 16-32 first guessed. Details + full tables: [paging/README.md](paging/README.md).
+**A cache miss costs ~0.7ms — disk all the way into VRAM.** io_uring + O_DIRECT random extent fetches from real repacked expert packs (`paging/nvmoe-iobench`), measured both into host RAM and end-to-end into a VRAM slab (`--gpu`: pinned staging + `cudaMemcpyHtoDAsync`, byte-verified): p50 0.7ms / p99 ~1ms per expert at QD1, peaking at **~7 GB/s and ~2,300 experts/s at QD2**, with the GPU hop costing only 2-5% (PCIe hides behind the NVMe reads — the SSD stays the bottleneck, as designed). ~220MB of pinned host RAM sustained the peak: the ≤4GB budget has 10x headroom. One surprise: throughput *falls* past QD4 (multi-MB reads are already parallel inside the SSD), so the prefetcher design keeps 2-4 reads in flight, not the 16-32 first guessed. Details + full tables: [paging/README.md](paging/README.md).
 
 **Real routing is very cacheable.** Traced Qwen3-30B-A3B (48 MoE layers, 128 experts/layer, top-8) across chat, code, story, and summarization — 1,396 decode tokens:
 
@@ -118,7 +118,7 @@ Prefill is the known weak spot: a long prompt touches nearly every expert (~18s 
 - [ ] **Phase 2 — runtime**: llama.cpp fork with an `exps=NVMe` placement path
   - [x] **2.1 offline repacker** (`tools/repack_gguf.py`): any MoE GGUF → resident GGUF + per-expert 4KB-aligned extents + manifest ([format spec](docs/PACK_FORMAT.md)); proven byte-lossless on OLMoE-1B-7B and Qwen3-30B-A3B via `tools/verify_pack.py`
   - [x] **2.2a io_uring extent reader** (`paging/`): raw-syscall io_uring + O_DIRECT benchmark on real packs — 0.7ms per expert miss, ~7GB/s @ QD2
-  - [ ] 2.2b pinned staging ring (≤4GB) + VRAM slab cache: end-to-end NVMe→VRAM microbenchmark (CUDA)
+  - [x] **2.2b NVMe→VRAM end-to-end** (`--gpu`): pinned staging + async H2D into a VRAM slab, byte-verified — the GPU hop costs 2-5%; ~6.6GB/s / ~2,300 experts/s to VRAM on ~220MB of host RAM. No CUDA toolkit needed (driver API via dlopen)
   - [ ] 2.3 llama.cpp integration: synchronous fetch-on-miss first (identical logits vs stock as the gate), then router-guided prefetch
   - [ ] 2.4 measured tok/s vs stock full-VRAM on Qwen3-30B-A3B, then GPT-OSS-120B
 - [ ] **Phase 3 — planner**: probe hardware, read GGUF metadata, emit the optimal quant + placement plan per model automatically
@@ -130,7 +130,8 @@ Prefill is the known weak spot: a long prompt touches nearly every expert (~18s 
 sim/            cache simulator: presets.py, trace_gen.py, cache_sim.py,
                 run_sim.py (CLI), trace_post.py, calibrate.py
 paging/         Phase 2 paging library: nvmoe_iobench.c (io_uring extent-fetch
-                benchmark, raw syscalls, no deps) + measured results
+                + NVMe→VRAM benchmark; raw syscalls + dlopen'd CUDA driver
+                API, no deps) + measured results
 collector/      llama.cpp trace tool (nvmoe-trace.cpp) + install.sh
 tools/          repack_gguf.py + verify_pack.py (GGUF → expert pack, Phase 2),
                 gguf_lite.py (stdlib GGUF reader/writer),
