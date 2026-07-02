@@ -6,3 +6,4 @@ traces/*.raw.jsonl
 *.gguf
 nvme_testfile
 paging/nvmoe-iobench
+.gate-gpu/

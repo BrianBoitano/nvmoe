@@ -27,6 +27,35 @@ detected from its `nvmoe.pack.version` KV.
 NVMOE_CACHE_MB=512 ./build/bin/llama-bench -m ...   # cap the expert cache
 ```
 
+## Lookahead prefetch (the fourth patch)
+
+At small cache budgets decode is fetch-bound, so the runtime predicts the
+*next* layer's experts before its router runs and fetches them during the
+current layer's matmuls. The predictor is one extra `mul_mat` per layer:
+layer L+1's router with the RMS-norm weight ratio `w_{L+1}/w_L` folded in
+at load time, applied to layer L's normed FFN input — exact up to L's
+missing FFN residual. Measured on both reference models, that contains
+**~86% of the ids actually routed** one layer ahead (top-8), and 83-86% of
+the extents it prefetches get used. A persistent fetch pool (`NVMOE_QD`
+workers) runs mandatory misses ahead of speculation, keeps one worker free
+of speculative jobs, and promotes queued speculation an op starts waiting
+on.
+
+Two variants measured slower and are off by default, kept as env knobs:
+top-16 prediction (`NVMOE_LOOKAHEAD=16`) and a two-layer horizon
+(`NVMOE_LOOKAHEAD_DEPTH=2`) — on an I/O-bound pipeline the wasted extents
+cost more than the extra hidden misses. Lookahead also auto-disables when
+the cache holds over 60% of the paged experts (its per-layer kernel
+launches, with CUDA graphs already off, outweigh the rare hidden miss);
+`NVMOE_LOOKAHEAD=8` forces it on, `NVMOE_LOOKAHEAD=0` off, and
+`NVMOE_PREFETCH=0` keeps the prediction statistics without speculative
+I/O. The stats print at model teardown (visible via `llama-nvmoe-logits`;
+`llama-bench` silences model logs).
+
+Rationale with data: the same-ids and offline-correlation predictors were
+evaluated against the Phase 1 traces first and rejected —
+`python3 tools/analyze_lookahead.py traces/qwen3-all.tokens.jsonl`.
+
 ## The correctness gate (run it yourself)
 
 `llama-nvmoe-logits` greedy-decodes a fixed prompt and dumps the **full
@@ -43,17 +72,25 @@ python3 tools/compare_logits.py /tmp/stock.bin /tmp/pack.bin
 ```
 
 Verified 2026-07-02 (this exact procedure; GPU rows on an RTX 5070 Ti,
-CUDA 12.8, `-ngl` as shown):
+CUDA 12.8, `-ngl` as shown; "prefetch" = lookahead prefetch active):
 
 | backend | model | steps | cache | result |
 |---|---|---|---|---|
 | CPU | OLMoE-1B-7B Q4_0 | 32 | all resident | BIT-IDENTICAL |
-| CPU | OLMoE-1B-7B Q4_0 | 32 | 512MB (35.6% hit, heavy eviction) | BIT-IDENTICAL |
+| CPU | OLMoE-1B-7B Q4_0 | 32 | 512MB (heavy eviction) | BIT-IDENTICAL |
+| CPU | OLMoE-1B-7B Q4_0 | 32 | 512MB + prefetch | BIT-IDENTICAL |
 | CPU | OLMoE-1B-7B Q4_0 | 48, second prompt | all resident | BIT-IDENTICAL |
 | CPU | Qwen3-30B-A3B Q4_K_M | 24 | all resident (2 pool groups, mixed Q4_K/Q6_K) | BIT-IDENTICAL |
+| CPU | Qwen3-30B-A3B Q4_K_M | 16 | 4GB + prefetch (eviction, 2 pool groups) | BIT-IDENTICAL |
 | CUDA `-ngl 99` | OLMoE-1B-7B Q4_0 | 32 | all resident in VRAM | BIT-IDENTICAL |
-| CUDA `-ngl 99` | OLMoE-1B-7B Q4_0 | 32 | 512MB VRAM (34% hit, heavy eviction) | BIT-IDENTICAL |
-| CUDA `-ngl 8` | OLMoE-1B-7B Q4_0 | 32 | pools split CPU + VRAM | BIT-IDENTICAL |
+| CUDA `-ngl 99` | OLMoE-1B-7B Q4_0 | 32 | 512MB VRAM (heavy eviction) | BIT-IDENTICAL |
+| CUDA `-ngl 99` | OLMoE-1B-7B Q4_0 | 32 | 512MB VRAM + prefetch | BIT-IDENTICAL |
+| CUDA `-ngl 8` | OLMoE-1B-7B Q4_0 | 32 | pools split CPU + VRAM (+ prefetch) | BIT-IDENTICAL |
+
+Prefetch cannot change the math — it only warms cache slots; the ids the
+matmuls consume always come from the real router — but the eviction /
+in-flight / remap interplay is exactly where a bug would hide, so the gate
+runs with it on.
 
 The gate tool disables CPU weight repacking (`use_extra_bufts = false`):
 the repacked interleaved kernels sum in a different order than the plain
@@ -97,22 +134,24 @@ The stock partial-offload row keeps ~5GB of layers in RAM; the exps=CPU
 row keeps all 17GB of experts in RAM. If that RAM isn't free — the whole
 premise of nvmoe — those configs don't exist.
 
-**Cache budget → throughput** (same pack, decode-only `-p 0 -n 128 -r 3`,
+**Cache budget → throughput** (same pack, decode-only `-p 0 -n 128 -r 5`,
 includes cold-start misses; the floor is `n_expert` slots per pool group):
 
-| NVMOE_CACHE_MB | share of experts | tg128 |
-|---|---|---|
-| 4096 | ~24% | 21.3 ± 0.2 |
-| 6144 | ~36% | 28.0 ± 2.5 |
-| 8192 | ~48% | 53.1 ± 9.2 |
-| 12288 | ~73% | 97.4 ± 55.3 cold-start / **166.1 ± 2.2 warm** |
+| NVMOE_CACHE_MB | share of experts | tg128, sync fetch | tg128, + lookahead prefetch |
+|---|---|---|---|
+| 4096 | ~24% | 21.9 ± 1.5 | **23.4 ± 1.4** |
+| 6144 | ~36% | 28.0 ± 2.5 *(older run, patch 3)* | — |
+| 8192 | ~48% | 60.2 ± 10.3 | **62.4 ± 10.9** |
+| 12288 | ~73% | **169.7 ± 1.4 warm** (`-p 512`; the 166.1 headline config re-measured on the patch-4 binary) | 161.7 ± 3.2 forced on |
 
 Hit rate becomes throughput, exactly as the Phase 1 trace curves
 predicted. Even the 8GB row beats the 17GB-of-RAM exps=CPU recipe.
-(The 4GB/8GB rows include the batched-miss overlap of the third patch —
-misses in one op are fetched by up to `NVMOE_QD` concurrent readers,
-default 4, the measured NVMe sweet spot; sequential fetching measured
-17.0 and 47.6 on the same rows. The 6144 row predates it.)
+Progression on the 4GB row across the patch series: sequential misses
+17.0 → QD-4 batched (patch 3) 21.9 → lookahead prefetch (patch 4) 23.4.
+Lookahead is worth ~4-7% where fetches dominate and costs ~4% where they
+don't (the 12288 row) — hence the auto-off. The sync columns are the
+same binary with `NVMOE_LOOKAHEAD=0`, measured back-to-back; the large
+± at 8192 is the cold first rep, common to both columns.
 
 ## The host-RAM proof (Phase 2 headline)
 

@@ -2,9 +2,10 @@
 
 The patch series in `runtime/patches/` teaches llama.cpp to run a model from
 an nvmoe pack ([PACK_FORMAT.md](PACK_FORMAT.md)) with the routed-expert
-weights paged from NVMe instead of loaded. This documents where it hooks in
-and why — enough to re-do the surgery on a different llama.cpp commit by
-hand if the patches ever stop applying.
+weights paged from NVMe instead of loaded — and, since the fourth patch, to
+prefetch the next layer's experts before its router has run. This documents
+where it hooks in and why — enough to re-do the surgery on a different
+llama.cpp commit by hand if the patches ever stop applying.
 
 ## The trick in one paragraph
 
@@ -105,14 +106,69 @@ Known quirk, not yet chased: upstream's `llama-eval-callback` example
 segfaults on a pack model (our own dump mode in `llama-nvmoe-logits -d`
 does the same job and works).
 
+## The lookahead prefetcher (fourth patch)
+
+The routing decision for layer L+1 is only known after layer L's FFN has
+run — too late to hide a ~0.7ms extent read. But the residual stream
+changes slowly per layer, so L+1's router applied to L's *input* is a good
+approximation of where L+1 will route. Two facts make this nearly free:
+
+- `build_moe_ffn` receives `cur = (x / rms(x)) ⊙ w_L` — this layer's
+  RMS-normed FFN input. L+1's router wants `(x' / rms(x')) ⊙ w_{L+1}` where
+  `x' = x + ffn_L(x) + attn_{L+1}(...)`. Approximate `x' ≈ x` and the norm
+  difference becomes a per-channel constant: fold
+  `W'[h,e] = gate_inp_{L+1}[h,e] · w_{L+1}[h] / w_L[h]` into a **lookahead
+  router** at load time (`llama_nvmoe_init_lookahead`), and the graph pays
+  exactly one extra `mul_mat` per layer.
+- The custom op already runs on the CPU with the scheduler copying its
+  inputs across — handing it the raw lookahead logits costs one more small
+  host copy, and the top-k happens in the op (a 128-float `partial_sort`).
+  An in-graph argsort was measured first and cost ~0.6ms/token at 48
+  layers: with CUDA graphs disabled by the custom-op splits, every extra
+  kernel launch is paid in full.
+
+Measured accuracy (both reference models, printed at teardown): the top-8
+prediction contains ~86% of the ids the real router then picks one layer
+ahead, ~79.5% two ahead. Prediction is input-dependent, which is why it
+beats any offline table — the misses at healthy budgets are the
+long tail that aggregate statistics rank last (the analysis that
+rejected the table approach: `tools/analyze_lookahead.py`).
+
+Fetches move to a persistent pool of `NVMOE_QD` workers. The op resolves
+its ids, enqueues real misses as *mandatory*, enqueues not-yet-cached
+predictions for the next layer as *speculative*, and blocks only until its
+own slots land. Three scheduling rules earned their keep in benchmarks:
+mandatory pops before speculative; speculation may never occupy the last
+free worker (a miss must not queue behind a full pipe of guesses); and a
+queued speculative fetch the op starts waiting on is promoted. All cache
+maps are mutated only on the graph thread — workers just read extents,
+`ggml_backend_tensor_set` into pool slots, and clear an in-flight flag —
+so bit-identity is preserved by construction (the matmul ids always come
+from the real router; prefetch only warms slots).
+
+What was tried and measured *slower* on the reference box, kept behind
+envs: top-16 prediction (`NVMOE_LOOKAHEAD=16`, ~2x wasted bytes on an
+I/O-bound pipeline) and a two-layer horizon (`NVMOE_LOOKAHEAD_DEPTH=2`,
+compounding error + speculative evictions). Lookahead auto-disables when
+the cache holds >60% of the paged experts — at near-resident budgets the
+48 extra matmul launches cost ~4% and there is almost nothing to hide.
+`NVMOE_PREFETCH=0` computes predictions and stats without speculative I/O.
+
 ## Constraints inherited by later stages
 
 - One `llama_context` per pack-loaded model: the custom op mutates cache
   state without locking across contexts.
 - Prefill sweeps experts by design (see DESIGN.md); the cache floor
-  guarantees correctness, not speed, for big ubatches.
+  guarantees correctness, not speed, for big ubatches — the fetch op skips
+  speculation for ubatches over 4 tokens.
 - The custom op runs on the CPU backend even in GPU builds (ggml custom ops
   are CPU-only). That is *correct* by construction — the scheduler copies
-  the tiny ids tensor to host and back — and it is where the fetch issues
-  its H2D copies from. It does cost graph splits (two per MoE layer), which
-  disables CUDA graphs; the prefetch stage is the right place to revisit.
+  the tiny ids tensor to host and back — and it is where the fetch pool is
+  driven from. It does cost graph splits (two per MoE layer), which
+  disables CUDA graphs; that launch overhead is also why the lookahead
+  top-k lives in the op, not the graph.
+- `graph_max_nodes()` budgets by `n_tensors`, which the pack *shrinks*
+  (the expert weights aren't file tensors) while the nvmoe path *adds*
+  nodes per layer — the patch gives the budget back explicitly. Symptom
+  when it bites: `GGML_ASSERT(obj_new)` in `ggml_new_object` during the
+  first graph build on many-layer models.

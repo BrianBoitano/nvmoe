@@ -67,11 +67,17 @@ k layers ahead so I/O overlaps attention/dense compute)
    adds ~3-8pp hit rate over plain LRU; revisit with real traces.
 
 3. **Prefetcher.** The routing decision for layer L is known after layer L's
-   router runs — too late to hide a 1-10ms read. Cross-layer predictors
-   (PreScope, HOBBIT) show upcoming-layer experts are predictable from
-   earlier-layer router logits with useful accuracy. MVP: lookahead-1 using
-   layer-similarity heuristics; later: a tiny learned predictor (runs on CPU,
-   negligible cost).
+   router runs — too late to hide a 1-10ms read. **Built (Phase 2.3c-ii,
+   fourth patch):** lookahead-1 by applying layer L+1's router (with the
+   RMS-norm weight ratio folded in offline) to layer L's FFN input —
+   measured to contain ~86% of the actually-routed ids at top-8. Two
+   candidate predictors were evaluated against the Phase 1 traces first and
+   rejected (`tools/analyze_lookahead.py`): same-id positional overlap is
+   exactly chance, and offline correlation tables can't predict the misses
+   that matter (the tail). Wider and deeper speculation both measured
+   slower — wasted extents cost more than hidden misses on an I/O-bound
+   pipeline — and lookahead auto-disables at near-resident budgets. See
+   docs/INTEGRATION.md for the mechanism.
 
 4. **io_uring reader.** O_DIRECT, registered buffers, queue depth tuned to
    saturate the SSD at expert-sized reads (1.8-13MB in target models — large

@@ -1,0 +1,859 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Ayers <brianboitano87@gmail.com>
+Date: Thu, 2 Jul 2026 10:41:55 -0700
+Subject: [PATCH 4/4] nvmoe: router-logit lookahead prefetch
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Hide expert-fetch latency behind compute by predicting the next paged
+layer's routing before its router runs. At layer L the graph pays one
+extra mul_mat against a precomputed lookahead router — layer L+1's
+gate_inp with the RMS-norm weight ratio w_{L+1}/w_L folded in, so
+applying it to L's normed FFN input approximates L+1's logits exactly
+up to L's missing FFN residual. The fetch op top-k's the raw logits on
+the CPU (an in-graph argsort would cost extra kernel launches with CUDA
+graphs already disabled by the custom op) and enqueues not-yet-cached
+predictions to a persistent fetch pool.
+
+The pool runs NVMOE_QD workers (mandatory misses ahead of speculation,
+one worker always kept free of speculative jobs, queued speculation an
+op is waiting on gets promoted). Cache-map mutation stays on the graph
+thread; workers only read extents and clear in-flight flags, so the
+existing LRU needed just flight/speculative slot flags. Prefetch never
+alters which expert a matmul reads — bit-identity is preserved by
+construction and verified: stock-vs-pack logits BIT-IDENTICAL on CPU
+and CUDA, all-resident, under heavy 512MB eviction, and with pools
+split across CPU+GPU.
+
+Measured on Qwen3-30B-A3B Q4_K_M (RTX 5070 Ti, 990 PRO): the predictor
+contains 86% of the actually-routed ids at top-8 one layer ahead
+(79.5% two ahead), 83-86% of issued prefetches get used, decode 21.9
+-> 23.4 t/s at a 4GB cache and 60.2 -> 62.4 at 8GB (same binary,
+back-to-back). Wider (top-16) and deeper (depth-2) prefetch both
+measured slower — wasted extents cost more than the hidden misses —
+so the default stays top-8 depth-1, and lookahead auto-disables when
+the cache holds over 60% of the paged experts, where its per-layer
+mul_mat launches outweigh the rare hidden miss (168+ t/s at a 12GB
+cache, unchanged). NVMOE_LOOKAHEAD / NVMOE_LOOKAHEAD_DEPTH /
+NVMOE_PREFETCH override; NVMOE_PREFETCH=0 keeps prediction stats
+without speculative I/O.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp |   6 +
+ src/llama-graph.cpp   |  18 +-
+ src/llama-model.cpp   |  10 +
+ src/llama-nvmoe.cpp   | 554 +++++++++++++++++++++++++++++++++++++++---
+ src/llama-nvmoe.h     |  77 +++++-
+ 5 files changed, 623 insertions(+), 42 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index c2beca8..584b874 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2329,6 +2329,12 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+     }
+     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
++    if (model.nvmoe) {
++        // paged expert tensors are absent from n_tensors, and the pack path
++        // adds nodes per MoE layer (id-remap op, lookahead matmul + top-k
++        // per horizon) — give their node budget back, with headroom
++        res += 32u * model.hparams.n_layer();
++    }
+     for (const auto & lora : model.loras) {
+         res += lora->get_n_nodes();
+     }
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 1f67067..e96d676 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1923,7 +1923,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+                 "nvmoe: per-expert weight scales not supported with paged experts");
+         GGML_ASSERT(arch != LLM_ARCH_GROVEMOE && "nvmoe: grovemoe id-division not supported with paged experts");
+ 
+-        ids_mm = llama_nvmoe_ids_remap(ctx0, lyr, selected_experts);
++        // lookahead: predict the upcoming paged layers' routing from this
++        // layer's FFN input (norm-ratio-folded routers, see
++        // llama_nvmoe_init_lookahead) and hand the raw logits to the fetch
++        // op, which top-k's them on the CPU (cheaper than in-graph argsort:
++        // the custom op disables CUDA graphs, so every extra kernel launch
++        // is paid in full) and prefetches during the coming matmuls
++        ggml_tensor * lk_logits[2] = { nullptr, nullptr };
++        for (int k = 0; k < 2; k++) {
++            ggml_tensor * lk_router = llama_nvmoe_lookahead_router(lyr, k);
++            if (lk_router == nullptr) {
++                break;
++            }
++            lk_logits[k] = build_lora_mm(lk_router, cur); // [n_expert, n_tokens]
++            cb(lk_logits[k], "ffn_moe_lk_logits", il);
++        }
++
++        ids_mm = llama_nvmoe_ids_remap(ctx0, lyr, selected_experts, lk_logits[0], lk_logits[1]);
+         cb(ids_mm, "ffn_moe_topk_nvmoe", il);
+ 
+         gate_exps = llama_nvmoe_pool(lyr, LLAMA_NVMOE_GATE);
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index f5b4268..1c20ccd 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1636,6 +1636,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             layer_dev[il] = pimpl->dev_layer[il].dev;
+         }
+         nvmoe.reset(llama_nvmoe_init(ml.nvmoe_dir, ml.nvmoe_manifest, cache_bytes, layer_dev));
++
++        // lookahead prefetch folds each layer's FFN norm + the next layer's
++        // router (both loaded above) into per-layer lookahead routers
++        std::vector<ggml_tensor *> lk_norm(n_layer_all, nullptr);
++        std::vector<ggml_tensor *> lk_gate(n_layer_all, nullptr);
++        for (int il = 0; il < n_layer_all && (size_t) il < layers.size(); ++il) {
++            lk_norm[il] = layers[il].ffn_norm;
++            lk_gate[il] = layers[il].ffn_gate_inp;
++        }
++        llama_nvmoe_init_lookahead(nvmoe.get(), lk_norm, lk_gate);
+     }
+ 
+     return true;
+diff --git a/src/llama-nvmoe.cpp b/src/llama-nvmoe.cpp
+index 2ccfaef..b50b427 100644
+--- a/src/llama-nvmoe.cpp
++++ b/src/llama-nvmoe.cpp
+@@ -26,11 +26,40 @@ static const char * llama_nvmoe_kind_names[LLAMA_NVMOE_KIND_COUNT] = {
+ };
+ 
+ llama_nvmoe_context::~llama_nvmoe_context() {
++    if (!workers.empty()) {
++        {
++            std::lock_guard<std::mutex> lock(mtx);
++            stop_workers = true;
++        }
++        cv_work.notify_all();
++        for (auto & w : workers) {
++            w.join();
++        }
++    }
++    // speculative fetches still sitting unused in the cache were wasted I/O
++    for (auto & g : groups) {
++        for (int32_t s = 0; s < g.n_slots; s++) {
++            if (s < (int32_t) g.slot_spec.size() && g.slot_spec[s]) {
++                n_spec_waste++;
++            }
++        }
++    }
+     if (n_ref > 0) {
+         LLAMA_LOG_INFO("nvmoe: %" PRIu64 " expert refs, %" PRIu64 " misses (%.2f%% hit), %.1f MiB fetched, %.3f s fetch time\n",
+                 n_ref, n_miss, 100.0 * (n_ref - n_miss) / n_ref,
+                 n_bytes / 1024.0 / 1024.0, t_fetch_us / 1e6);
+     }
++    if (n_pred[0] > 0) {
++        char plus2[64] = "";
++        if (n_pred[1] > 0) {
++            snprintf(plus2, sizeof(plus2), ", %.2f%% at +2", 100.0 * n_pred_hit[1] / n_pred[1]);
++        }
++        LLAMA_LOG_INFO("nvmoe: lookahead top-%d: predicted %.2f%% of routed ids at +1%s; %" PRIu64 " prefetches (%.1f%% used, %.1f%% wasted), %.3f s op wait\n",
++                lk_top, 100.0 * n_pred_hit[0] / n_pred[0], plus2, n_spec,
++                n_spec ? 100.0 * n_spec_used  / n_spec : 0.0,
++                n_spec ? 100.0 * n_spec_waste / n_spec : 0.0,
++                t_wait_us / 1e6);
++    }
+     if (fd >= 0) {
+         close(fd);
+     }
+@@ -207,9 +236,11 @@ llama_nvmoe_context * llama_nvmoe_init(const std::string & pack_dir, const std::
+         }
+         g.n_slots = (int32_t) n_slots;
+ 
+-        g.slot_key .assign(g.n_slots, -1);
+-        g.slot_used.assign(g.n_slots,  0);
+-        g.slot_op  .assign(g.n_slots,  0);
++        g.slot_key   .assign(g.n_slots, -1);
++        g.slot_used  .assign(g.n_slots,  0);
++        g.slot_op    .assign(g.n_slots,  0);
++        g.slot_flight.assign(g.n_slots,  0);
++        g.slot_spec  .assign(g.n_slots,  0);
+         g.buft = s.buft;
+     }
+ 
+@@ -322,6 +353,224 @@ llama_nvmoe_context * llama_nvmoe_init(const std::string & pack_dir, const std::
+     return ctx.release();
+ }
+ 
++// fetch-pool worker: take a job (mandatory misses before speculative
++// prefetches), read its extent into this reader's bounce slice, scatter it
++// into the pool, clear the slot's in-flight flag. The mutex is dropped
++// around the I/O so up to qd fetches overlap.
++static void llama_nvmoe_fetch(llama_nvmoe_layer * lyr, int32_t expert, int32_t slot, int reader);
++
++static void llama_nvmoe_worker(llama_nvmoe_context * nc, int reader) {
++    std::unique_lock<std::mutex> lock(nc->mtx);
++    for (;;) {
++        // speculative jobs may not occupy every worker: one stays free so a
++        // mandatory miss never waits behind a full pipe of speculation
++        auto can_spec = [&] { return !nc->q_spec.empty() && nc->n_spec_active < nc->qd - 1; };
++        nc->cv_work.wait(lock, [&] { return nc->stop_workers || !nc->q_mand.empty() || can_spec(); });
++        if (nc->stop_workers) {
++            return;
++        }
++        const bool spec = nc->q_mand.empty();
++        auto & q = spec ? nc->q_spec : nc->q_mand;
++        const llama_nvmoe_context::fetch_job job = q.front();
++        q.pop_front();
++        if (spec) {
++            nc->n_spec_active++;
++        }
++
++        lock.unlock();
++        const int64_t t0 = ggml_time_us();
++        llama_nvmoe_fetch(job.lyr, job.expert, job.slot, reader);
++        const int64_t dt = ggml_time_us() - t0;
++        lock.lock();
++
++        if (spec) {
++            nc->n_spec_active--;
++        }
++        nc->t_fetch_us += dt; // cumulative reader-busy time (fetches overlap)
++        nc->groups[job.lyr->group].slot_flight[job.slot] = 0;
++        nc->cv_done.notify_all();
++        nc->cv_work.notify_all(); // a spec slot may have opened up
++    }
++}
++
++void llama_nvmoe_init_lookahead(llama_nvmoe_context * nc,
++        const std::vector<ggml_tensor *> & ffn_norm,
++        const std::vector<ggml_tensor *> & gate_inp) {
++    // auto default: lookahead pays for itself where misses are plentiful
++    // (small cache budgets) and costs ~4% where they are not (its extra
++    // mul_mat launches, with CUDA graphs already disabled by the custom op,
++    // outweigh the rare hidden miss). Threshold: on when the cache holds
++    // under 60% of the paged experts. NVMOE_LOOKAHEAD forces either way.
++    {
++        int64_t slots = 0, all = 0;
++        std::vector<int64_t> group_layers(nc->groups.size(), 0);
++        for (auto & lyr : nc->layers) {
++            if (lyr) {
++                group_layers[lyr->group]++;
++            }
++        }
++        for (size_t gi = 0; gi < nc->groups.size(); gi++) {
++            slots += nc->groups[gi].n_slots;
++            all   += group_layers[gi] * nc->n_expert;
++        }
++        nc->lk_top = all > 0 && slots < all * 6 / 10 ? nc->n_expert_used : 0;
++    }
++    if (const char * s = getenv("NVMOE_LOOKAHEAD")) {
++        nc->lk_top = atoi(s);
++    }
++    nc->lk_top = std::max(0, std::min(nc->lk_top, (int) nc->n_expert));
++    if (nc->lk_top == 0) {
++        LLAMA_LOG_INFO("nvmoe: lookahead off (cache holds most experts; set NVMOE_LOOKAHEAD to force it on)\n");
++    }
++    if (const char * s = getenv("NVMOE_LOOKAHEAD_DEPTH")) {
++        nc->lk_depth = std::max(1, std::min(2, atoi(s)));
++    }
++    if (const char * s = getenv("NVMOE_PREFETCH")) {
++        nc->prefetch = atoi(s) != 0;
++    }
++    if (nc->lk_top == 0) {
++        return; // legacy synchronous path, none of the pool machinery runs
++    }
++
++    // chain each paged layer to its successors
++    {
++        std::vector<int> paged;
++        for (size_t il = 0; il < nc->layers.size(); il++) {
++            if (nc->layers[il]) {
++                paged.push_back((int) il);
++            }
++        }
++        for (size_t i = 0; i < paged.size(); i++) {
++            for (int k = 0; k < nc->lk_depth; k++) {
++                if (i + k + 1 < paged.size()) {
++                    nc->layers[paged[i]]->il_next[k] = paged[i + k + 1];
++                }
++            }
++        }
++    }
++
++    // small tensors (norm weights, routers) read to host as f32
++    auto read_f32 = [](ggml_tensor * t) -> std::vector<float> {
++        const int64_t n = ggml_nelements(t);
++        std::vector<float> v;
++        if (t->type == GGML_TYPE_F32) {
++            v.resize(n);
++            ggml_backend_tensor_get(t, v.data(), 0, n * sizeof(float));
++        } else if (t->type == GGML_TYPE_F16) {
++            std::vector<ggml_fp16_t> h(n);
++            ggml_backend_tensor_get(t, h.data(), 0, n * sizeof(ggml_fp16_t));
++            v.resize(n);
++            for (int64_t i = 0; i < n; i++) {
++                v[i] = ggml_fp16_to_fp32(h[i]);
++            }
++        }
++        return v;
++    };
++
++    // the lookahead routers predict il_next[k]'s routing from THIS layer's
++    // FFN input `cur = (x / rms(x)) * w_this`. il_next[k]'s true logits on
++    // the same residual x would be `gate_inp_ahead @ ((x / rms(x)) * w_ahead)`,
++    // so fold the norm-weight ratio into the router once, offline:
++    //     W'[h, e] = gate_inp_ahead[h, e] * w_ahead[h] / w_this[h]
++    // and the graph pays one extra mul_mat per layer per horizon. The only
++    // approximation left is the missing residual contributions of the
++    // layers in between (one FFN + one attention block per horizon step).
++    struct lk_plan {
++        llama_nvmoe_layer * lyr;
++        int                 horizon;
++        std::vector<float>  w; // [n_embd * n_expert]
++    };
++    std::vector<lk_plan> plans;
++    int64_t lk_bytes = 0;
++    for (auto & lyr : nc->layers) {
++        if (!lyr) {
++            continue;
++        }
++        for (int k = 0; k < nc->lk_depth; k++) {
++            const int il = lyr->il, jl = lyr->il_next[k];
++            if (jl < 0 || (size_t) il >= ffn_norm.size() || (size_t) jl >= ffn_norm.size() ||
++                    !ffn_norm[il] || !ffn_norm[jl] || !gate_inp[jl]) {
++                continue;
++            }
++            const int64_t n_embd = ffn_norm[il]->ne[0];
++            ggml_tensor * gi = gate_inp[jl];
++            if (gi->ne[0] != n_embd || gi->ne[1] != nc->n_expert || ffn_norm[jl]->ne[0] != n_embd) {
++                LLAMA_LOG_WARN("nvmoe: lookahead: unexpected router/norm shape at layer %d, skipping\n", il);
++                continue;
++            }
++            std::vector<float> wn_this = read_f32(ffn_norm[il]);
++            std::vector<float> wn_next = read_f32(ffn_norm[jl]);
++            std::vector<float> router  = read_f32(gi);
++            if (wn_this.empty() || wn_next.empty() || router.empty()) {
++                LLAMA_LOG_WARN("nvmoe: lookahead: unsupported tensor type at layer %d, skipping\n", il);
++                continue;
++            }
++            lk_plan p;
++            p.lyr     = lyr.get();
++            p.horizon = k;
++            p.w.resize((size_t) n_embd * nc->n_expert);
++            for (int64_t h = 0; h < n_embd; h++) {
++                const float d = wn_this[h];
++                const float r = fabsf(d) > 1e-30f ? wn_next[h] / d : 0.0f;
++                for (int64_t e = 0; e < nc->n_expert; e++) {
++                    p.w[(size_t) e * n_embd + h] = router[(size_t) e * n_embd + h] * r;
++                }
++            }
++            lk_bytes += (int64_t) p.w.size() * sizeof(float);
++            plans.push_back(std::move(p));
++        }
++    }
++
++    // allocate the routers grouped per buffer type, like the pools
++    {
++        std::vector<ggml_backend_buffer_type_t> bufts;
++        for (auto & p : plans) {
++            ggml_backend_buffer_type_t buft = nc->groups[p.lyr->group].buft;
++            if (std::find(bufts.begin(), bufts.end(), buft) == bufts.end()) {
++                bufts.push_back(buft);
++            }
++        }
++        for (auto buft : bufts) {
++            ggml_init_params ip = {
++                /*.mem_size   =*/ ggml_tensor_overhead() * plans.size(),
++                /*.mem_buffer =*/ nullptr,
++                /*.no_alloc   =*/ true,
++            };
++            ggml_context_ptr lctx { ggml_init(ip) };
++            if (!lctx) {
++                throw std::runtime_error("nvmoe: failed to create lookahead context");
++            }
++            for (auto & p : plans) {
++                if (nc->groups[p.lyr->group].buft != buft) {
++                    continue;
++                }
++                const int64_t n_embd = (int64_t) (p.w.size() / nc->n_expert);
++                ggml_tensor * t = ggml_new_tensor_2d(lctx.get(), GGML_TYPE_F32, n_embd, nc->n_expert);
++                ggml_format_name(t, "nvmoe_lk_router.%d.%d", p.lyr->il, p.horizon);
++                p.lyr->lk_router[p.horizon] = t;
++            }
++            ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(lctx.get(), buft) };
++            if (!buf) {
++                throw std::runtime_error(std::string("nvmoe: failed to allocate lookahead buffer in ") + ggml_backend_buft_name(buft));
++            }
++            ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++            nc->ctx_lk.emplace_back(std::move(lctx));
++            nc->buf_lk.emplace_back(std::move(buf));
++        }
++        for (auto & p : plans) {
++            ggml_backend_tensor_set(p.lyr->lk_router[p.horizon], p.w.data(), 0, p.w.size() * sizeof(float));
++        }
++    }
++
++    for (int r = 0; r < nc->qd; r++) {
++        nc->workers.emplace_back(llama_nvmoe_worker, nc, r);
++    }
++
++    LLAMA_LOG_INFO("nvmoe: lookahead top-%d depth-%d: %zu routers (%.1f MiB), %d fetch workers, prefetch %s\n",
++            nc->lk_top, nc->lk_depth, plans.size(), lk_bytes / 1024.0 / 1024.0, nc->qd,
++            nc->prefetch ? "on" : "off (stats only)");
++}
++
+ llama_nvmoe_layer * llama_nvmoe_get_layer(const llama_nvmoe_context * ctx, int il) {
+     if (il < 0 || (size_t) il >= ctx->layers.size()) {
+         return nullptr;
+@@ -362,28 +611,41 @@ static void llama_nvmoe_fetch(llama_nvmoe_layer * lyr, int32_t expert, int32_t s
+     }
+ }
+ 
+-// the custom op: for every selected expert id, make sure the expert is
+-// resident in the pool and write out its slot index.
+-//
+-// Two passes: the first walks the ids, resolves hits, and assigns victim
+-// slots for the distinct misses; the fetches then run with LLAMA_NVMOE_QD
+-// concurrent readers (multi-MB extent reads peak at queue depth 2-4 on
+-// NVMe — measured in paging/ — and both pread and cudaMemcpy are
+-// thread-safe). Decode ops rarely miss more than once, but cold starts,
+-// prefill sweeps, and small cache budgets batch many misses per op.
+-static void llama_nvmoe_fetch_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+-    GGML_UNUSED(nth);
+-    if (ith != 0) {
+-        return;
++// victim slot: first empty, else LRU among slots that are neither pinned by
++// the current op nor mid-fetch. -1 when nothing is evictable.
++static int32_t llama_nvmoe_victim(llama_nvmoe_group & g, const llama_nvmoe_context * nc) {
++    int32_t  slot = -1;
++    uint64_t best = UINT64_MAX;
++    for (int32_t s = 0; s < g.n_slots; s++) {
++        if (g.slot_key[s] < 0) {
++            return s;
++        }
++        if (g.slot_op[s] == nc->epoch || g.slot_flight[s]) {
++            continue;
++        }
++        if (g.slot_used[s] < best) {
++            best = g.slot_used[s];
++            slot = s;
++        }
+     }
++    return slot;
++}
+ 
+-    GGML_ASSERT(a->type == GGML_TYPE_I32 && ggml_is_contiguous(a));
+-
+-    llama_nvmoe_layer   * lyr = (llama_nvmoe_layer *) userdata;
+-    llama_nvmoe_context * nc  = lyr->ctx;
+-    llama_nvmoe_group   & g   = nc->groups[lyr->group];
++static void llama_nvmoe_evict(llama_nvmoe_group & g, llama_nvmoe_context * nc, int32_t slot) {
++    if (g.slot_key[slot] >= 0) {
++        if (g.slot_spec[slot]) {
++            g.slot_spec[slot] = 0;
++            nc->n_spec_waste++;
++        }
++        g.where.erase(g.slot_key[slot]);
++    }
++}
+ 
+-    nc->epoch++;
++// the legacy synchronous path (lookahead off): resolve ids, then fetch the
++// op's misses with qd transient readers and return when all are resident
++static void llama_nvmoe_fetch_op_sync(ggml_tensor * dst, const ggml_tensor * a, llama_nvmoe_layer * lyr) {
++    llama_nvmoe_context * nc = lyr->ctx;
++    llama_nvmoe_group   & g  = nc->groups[lyr->group];
+ 
+     const int64_t n = ggml_nelements(a);
+     const int32_t * ids = (const int32_t *) a->data;
+@@ -404,25 +666,11 @@ static void llama_nvmoe_fetch_op(ggml_tensor * dst, const ggml_tensor * a, int i
+         } else {
+             nc->n_miss++;
+ 
+-            // victim: first empty slot, else LRU among slots not pinned by this op
+-            slot = -1;
+-            uint64_t best = UINT64_MAX;
+-            for (int32_t s = 0; s < g.n_slots; s++) {
+-                if (g.slot_key[s] < 0) {
+-                    slot = s;
+-                    break;
+-                }
+-                if (g.slot_op[s] != nc->epoch && g.slot_used[s] < best) {
+-                    best = g.slot_used[s];
+-                    slot = s;
+-                }
+-            }
++            slot = llama_nvmoe_victim(g, nc);
+             if (slot < 0) {
+                 GGML_ABORT("nvmoe: expert cache too small for a single op (n_slots = %d)", g.n_slots);
+             }
+-            if (g.slot_key[slot] >= 0) {
+-                g.where.erase(g.slot_key[slot]);
+-            }
++            llama_nvmoe_evict(g, nc, slot);
+ 
+             g.slot_key[slot] = key;
+             g.where[key]     = slot;
+@@ -464,10 +712,238 @@ static void llama_nvmoe_fetch_op(ggml_tensor * dst, const ggml_tensor * a, int i
+     nc->n_bytes    += misses.size() * lyr->group_stride;
+ }
+ 
+-ggml_tensor * llama_nvmoe_ids_remap(ggml_context * ctx0, llama_nvmoe_layer * lyr, ggml_tensor * selected_experts) {
++// the pooled path (lookahead on): resolve ids, enqueue this op's misses as
++// mandatory jobs, enqueue speculative prefetches for il_next from the
++// predicted ids, and return once every id this op needs is resident. The
++// speculative fetches then land during the layers' matmuls — that overlap
++// is the whole point.
++static void llama_nvmoe_fetch_op_pool(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b[2], llama_nvmoe_layer * lyr) {
++    llama_nvmoe_context * nc = lyr->ctx;
++    llama_nvmoe_group   & g  = nc->groups[lyr->group];
++
++    const int64_t n        = ggml_nelements(a);
++    const int64_t n_tokens = a->ne[1];
++    const int32_t * ids = (const int32_t *) a->data;
++    int32_t       * out = (int32_t *) dst->data;
++
++    // decode-sized ops only: a prefill ubatch predicts nearly every expert
++    // at once, which would just thrash the cache it is about to sweep anyway
++    const bool lookahead = n_tokens <= 4;
++
++    std::unique_lock<std::mutex> lock(nc->mtx);
++
++    // prediction accuracy, measured against what earlier layers predicted
++    for (int k = 0; k < 2; k++) {
++        if (!lookahead || lyr->pred[k].empty()) {
++            continue;
++        }
++        for (int64_t i = 0; i < n; i++) {
++            nc->n_pred[k]++;
++            if (std::find(lyr->pred[k].begin(), lyr->pred[k].end(), ids[i]) != lyr->pred[k].end()) {
++                nc->n_pred_hit[k]++;
++            }
++        }
++        lyr->pred[k].clear();
++    }
++
++    std::vector<int32_t> wait_slots;
++
++    for (int64_t i = 0; i < n; i++) {
++        const int32_t e = ids[i];
++        GGML_ASSERT(e >= 0 && e < nc->n_expert);
++
++        const int64_t key = ((int64_t) lyr->il << 32) | (uint32_t) e;
++
++        int32_t slot;
++        const auto it = g.where.find(key);
++        if (it != g.where.end()) {
++            slot = it->second;
++            if (g.slot_spec[slot]) {
++                g.slot_spec[slot] = 0;
++                nc->n_spec_used++;
++            }
++            if (g.slot_flight[slot]) {
++                wait_slots.push_back(slot); // prefetch still in the air
++            }
++        } else {
++            nc->n_miss++;
++
++            slot = llama_nvmoe_victim(g, nc);
++            if (slot < 0) {
++                GGML_ABORT("nvmoe: expert cache too small for a single op (n_slots = %d)", g.n_slots);
++            }
++            llama_nvmoe_evict(g, nc, slot);
++
++            g.slot_key[slot]    = key;
++            g.where[key]        = slot;
++            g.slot_flight[slot] = 1;
++
++            nc->q_mand.push_back({lyr, e, slot});
++            nc->n_bytes += lyr->group_stride;
++            wait_slots.push_back(slot);
++        }
++
++        nc->n_ref++;
++        g.slot_used[slot] = ++nc->tick;
++        g.slot_op[slot]   = nc->epoch;
++
++        out[i] = slot;
++    }
++
++    // speculative prefetch for the upcoming paged layers; the +1 horizon is
++    // enqueued first so it stays ahead of the +2 horizon in the queue.
++    // b[k] holds raw lookahead logits [n_expert, n_tokens]; top-k them here
++    // on the CPU (an in-graph argsort would cost a kernel launch per layer
++    // with CUDA graphs already disabled by this op)
++    std::vector<int32_t> pred_ids;
++    for (int k = 0; k < 2 && lookahead; k++) {
++        if (b[k] == nullptr || lyr->il_next[k] < 0) {
++            continue;
++        }
++        llama_nvmoe_layer * nl = nc->layers[lyr->il_next[k]].get();
++        llama_nvmoe_group & ng = nc->groups[nl->group];
++
++        GGML_ASSERT(b[k]->ne[0] == nc->n_expert);
++
++        pred_ids.clear();
++        for (int64_t t = 0; t < b[k]->ne[1]; t++) {
++            const float * logits = (const float *) ((const char *) b[k]->data + t * b[k]->nb[1]);
++            const int m = std::min<int>(nc->lk_top, (int) nc->n_expert);
++            std::vector<int32_t> idx(nc->n_expert);
++            for (int32_t e = 0; e < nc->n_expert; e++) {
++                idx[e] = e;
++            }
++            std::partial_sort(idx.begin(), idx.begin() + m, idx.end(),
++                    [logits](int32_t x, int32_t y) { return logits[x] > logits[y]; });
++            pred_ids.insert(pred_ids.end(), idx.begin(), idx.begin() + m);
++        }
++
++        nl->pred[k] = pred_ids;
++
++        if (nc->prefetch) {
++            for (const int32_t e : pred_ids) {
++                const int64_t key = ((int64_t) nl->il << 32) | (uint32_t) e;
++                if (ng.where.count(key)) {
++                    continue; // resident or already in flight
++                }
++                const int32_t slot = llama_nvmoe_victim(ng, nc);
++                if (slot < 0) {
++                    break; // nothing evictable; speculation yields
++                }
++                llama_nvmoe_evict(ng, nc, slot);
++
++                ng.slot_key[slot]    = key;
++                ng.where[key]        = slot;
++                ng.slot_flight[slot] = 1;
++                ng.slot_spec[slot]   = 1;
++                ng.slot_used[slot]   = ++nc->tick;
++
++                nc->q_spec.push_back({nl, e, slot});
++                nc->n_spec++;
++                nc->n_bytes += nl->group_stride;
++            }
++        }
++    }
++
++    // a queued speculative fetch this op is about to wait on is speculative
++    // no more — promote it ahead of the other speculation
++    if (!wait_slots.empty() && !nc->q_spec.empty()) {
++        for (auto it = nc->q_spec.begin(); it != nc->q_spec.end(); ) {
++            if (it->lyr == lyr && std::find(wait_slots.begin(), wait_slots.end(), it->slot) != wait_slots.end()) {
++                nc->q_mand.push_back(*it);
++                it = nc->q_spec.erase(it);
++            } else {
++                ++it;
++            }
++        }
++    }
++
++    if (!nc->q_mand.empty() || !nc->q_spec.empty()) {
++        nc->cv_work.notify_all();
++    }
++
++    if (!wait_slots.empty()) {
++        const int64_t t0 = ggml_time_us();
++        nc->cv_done.wait(lock, [&] {
++            for (const int32_t s : wait_slots) {
++                if (g.slot_flight[s]) {
++                    return false;
++                }
++            }
++            return true;
++        });
++        nc->t_wait_us += ggml_time_us() - t0;
++    }
++}
++
++static void llama_nvmoe_fetch_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
++    GGML_UNUSED(nth);
++    if (ith != 0) {
++        return;
++    }
++    GGML_ASSERT(a->type == GGML_TYPE_I32 && ggml_is_contiguous(a));
++
++    llama_nvmoe_layer * lyr = (llama_nvmoe_layer *) userdata;
++    lyr->ctx->epoch++;
++
++    if (lyr->ctx->workers.empty()) {
++        llama_nvmoe_fetch_op_sync(dst, a, lyr);
++    } else {
++        const ggml_tensor * b[2] = { nullptr, nullptr };
++        llama_nvmoe_fetch_op_pool(dst, a, b, lyr);
++    }
++}
++
++static void llama_nvmoe_fetch_op2(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b0, int ith, int nth, void * userdata) {
++    GGML_UNUSED(nth);
++    if (ith != 0) {
++        return;
++    }
++    GGML_ASSERT(a->type  == GGML_TYPE_I32 && ggml_is_contiguous(a));
++    GGML_ASSERT(b0->type == GGML_TYPE_F32);
++
++    llama_nvmoe_layer * lyr = (llama_nvmoe_layer *) userdata;
++    lyr->ctx->epoch++;
++
++    const ggml_tensor * b[2] = { b0, nullptr };
++    llama_nvmoe_fetch_op_pool(dst, a, b, lyr);
++}
++
++static void llama_nvmoe_fetch_op3(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b0, const ggml_tensor * b1, int ith, int nth, void * userdata) {
++    GGML_UNUSED(nth);
++    if (ith != 0) {
++        return;
++    }
++    GGML_ASSERT(a->type  == GGML_TYPE_I32 && ggml_is_contiguous(a));
++    GGML_ASSERT(b0->type == GGML_TYPE_F32);
++    GGML_ASSERT(b1->type == GGML_TYPE_F32);
++
++    llama_nvmoe_layer * lyr = (llama_nvmoe_layer *) userdata;
++    lyr->ctx->epoch++;
++
++    const ggml_tensor * b[2] = { b0, b1 };
++    llama_nvmoe_fetch_op_pool(dst, a, b, lyr);
++}
++
++ggml_tensor * llama_nvmoe_lookahead_router(const llama_nvmoe_layer * lyr, int horizon) {
++    return lyr->ctx->lk_top > 0 && horizon < lyr->ctx->lk_depth ? lyr->lk_router[horizon] : nullptr;
++}
++
++int llama_nvmoe_lookahead_n(const llama_nvmoe_context * ctx) {
++    return ctx->lk_top;
++}
++
++ggml_tensor * llama_nvmoe_ids_remap(ggml_context * ctx0, llama_nvmoe_layer * lyr, ggml_tensor * selected_experts,
++        ggml_tensor * lk_logits0, ggml_tensor * lk_logits1) {
+     // selected_experts is usually a strided view (argsort_top_k); the op wants flat i32
+     if (!ggml_is_contiguous(selected_experts)) {
+         selected_experts = ggml_cont(ctx0, selected_experts);
+     }
++    if (lk_logits0 != nullptr && lk_logits1 != nullptr) {
++        return ggml_map_custom3(ctx0, selected_experts, lk_logits0, lk_logits1, llama_nvmoe_fetch_op3, 1, lyr);
++    }
++    if (lk_logits0 != nullptr) {
++        return ggml_map_custom2(ctx0, selected_experts, lk_logits0, llama_nvmoe_fetch_op2, 1, lyr);
++    }
+     return ggml_map_custom1(ctx0, selected_experts, llama_nvmoe_fetch_op, 1, lyr);
+ }
+diff --git a/src/llama-nvmoe.h b/src/llama-nvmoe.h
+index e9478ed..81c492c 100644
+--- a/src/llama-nvmoe.h
++++ b/src/llama-nvmoe.h
+@@ -22,9 +22,13 @@
+ #include "ggml-backend.h"
+ #include "ggml-cpp.h"
+ 
++#include <condition_variable>
+ #include <cstdint>
++#include <deque>
+ #include <memory>
++#include <mutex>
+ #include <string>
++#include <thread>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -59,6 +63,18 @@ struct llama_nvmoe_layer {
+     size_t group_stride = 0; // padded to pack alignment
+ 
+     std::vector<uint64_t> ext_off; // absolute pack offset per expert
++
++    // lookahead (2.3c-ii): predict upcoming paged layers' routing from this
++    // layer's FFN input. lk_router[k] = the (k+1)-layers-ahead router with
++    // the RMS-norm weight ratio w_ahead/w_this folded in, so
++    // `lk_router[k] @ cur` approximates that layer's logits exactly up to
++    // the residual contributions of the layers in between.
++    int           il_next[2]   = { -1, -1 };           // next paged MoE layers
++    ggml_tensor * lk_router[2] = { nullptr, nullptr }; // [n_embd, n_expert] F32, on this layer's device
++
++    // ids predicted FOR this layer at earlier ops, per horizon (graph thread
++    // only; [0] set one layer back, [1] two layers back)
++    std::vector<int32_t> pred[2];
+ };
+ 
+ // layers with identical part geometry AND the same target buffer type share
+@@ -75,6 +91,8 @@ struct llama_nvmoe_group {
+     std::vector<int64_t>  slot_key;  // -1 = empty
+     std::vector<uint64_t> slot_used; // last-use tick (LRU)
+     std::vector<uint64_t> slot_op;   // op epoch that pinned the slot
++    std::vector<uint8_t>  slot_flight; // fetch in flight (guarded by ctx mtx)
++    std::vector<uint8_t>  slot_spec;   // speculatively fetched, not yet used
+     std::unordered_map<int64_t, int32_t> where;
+ };
+ 
+@@ -111,12 +129,48 @@ struct llama_nvmoe_context {
+     uint64_t tick  = 0; // LRU clock
+     uint64_t epoch = 0; // custom-op invocation counter (for per-op pinning)
+ 
++    // lookahead prefetch (2.3c-ii). When lk_top > 0 the fetch pool below is
++    // live and every fetch goes through it; when 0 the original per-op
++    // synchronous path runs and none of this state is used.
++    int  lk_top   = 0;    // predicted ids per token (NVMOE_LOOKAHEAD, 0 = off)
++    int  lk_depth = 1;    // prefetch horizon in layers, 1-2 (NVMOE_LOOKAHEAD_DEPTH)
++    bool prefetch = true; // issue speculative fetches (NVMOE_PREFETCH=0: stats only)
++
++    std::vector<ggml_context_ptr>        ctx_lk;
++    std::vector<ggml_backend_buffer_ptr> buf_lk;
++
++    // fetch pool: qd persistent workers, mandatory misses ahead of
++    // speculative prefetches. Cache-map mutation happens only on the graph
++    // thread; workers read extents into their bounce slice, tensor_set into
++    // the pool, and clear the slot's in-flight flag under mtx.
++    struct fetch_job {
++        llama_nvmoe_layer * lyr;
++        int32_t expert;
++        int32_t slot;
++    };
++    std::mutex               mtx;
++    std::condition_variable  cv_work, cv_done;
++    std::deque<fetch_job>    q_mand, q_spec;
++    std::vector<std::thread> workers;
++    int  n_spec_active = 0;    // workers currently on speculative jobs; capped
++                               // at qd-1 so a mandatory miss never queues
++                               // behind a full pipe of speculation
++    bool stop_workers = false;
++
+     // stats, counted per expert reference (top_k * n_tokens per layer op)
+     uint64_t n_ref   = 0;
+     uint64_t n_miss  = 0;
+     uint64_t n_bytes = 0;  // bytes fetched from the pack
+     int64_t  t_fetch_us = 0;
+ 
++    // lookahead stats (decode-sized ops only), per horizon
++    uint64_t n_pred[2]     = { 0, 0 }; // references checked against a prediction
++    uint64_t n_pred_hit[2] = { 0, 0 }; // ... that the prediction contained
++    uint64_t n_spec       = 0; // speculative fetches issued
++    uint64_t n_spec_used  = 0; // ... later referenced
++    uint64_t n_spec_waste = 0; // ... evicted (or left over) unreferenced
++    int64_t  t_wait_us    = 0; // op time spent waiting on in-flight fetches
++
+     ~llama_nvmoe_context();
+ };
+ 
+@@ -126,11 +180,30 @@ struct llama_nvmoe_context {
+ llama_nvmoe_context * llama_nvmoe_init(const std::string & pack_dir, const std::string & manifest_name, int64_t cache_bytes,
+         const std::vector<ggml_backend_dev_t> & layer_dev);
+ 
++// after weights load: build the lookahead routers and start the fetch pool.
++// ffn_norm / gate_inp are the model's per-layer tensors, indexed by il
++// (null where absent); layers without both are skipped.
++void llama_nvmoe_init_lookahead(llama_nvmoe_context * ctx,
++        const std::vector<ggml_tensor *> & ffn_norm,
++        const std::vector<ggml_tensor *> & gate_inp);
++
+ // per-layer handle for graph building; null if il is not a paged MoE layer
+ llama_nvmoe_layer * llama_nvmoe_get_layer(const llama_nvmoe_context * ctx, int il);
+ 
+ // pool tensor for a kind; null if the arch has no such matrix
+ ggml_tensor * llama_nvmoe_pool(const llama_nvmoe_layer * lyr, llama_nvmoe_kind kind);
+ 
+-// build-time: wrap selected_experts in the fetch+remap custom op
+-ggml_tensor * llama_nvmoe_ids_remap(ggml_context * ctx0, llama_nvmoe_layer * lyr, ggml_tensor * selected_experts);
++// lookahead router for predicting il_next[horizon]'s ids; null when
++// lookahead is off, the horizon is beyond lk_depth, or there is no such layer
++ggml_tensor * llama_nvmoe_lookahead_router(const llama_nvmoe_layer * lyr, int horizon);
++
++// how many predicted ids per token the fetch op wants (top-k of the
++// lookahead logits)
++int llama_nvmoe_lookahead_n(const llama_nvmoe_context * ctx);
++
++// build-time: wrap selected_experts in the fetch+remap custom op.
++// lk_logits[k] ([n_expert, n_tokens] f32, lookahead logits for il_next[k])
++// may be null; lk_logits[1] requires lk_logits[0]. The op top-k's them on
++// the CPU.
++ggml_tensor * llama_nvmoe_ids_remap(ggml_context * ctx0, llama_nvmoe_layer * lyr, ggml_tensor * selected_experts,
++        ggml_tensor * lk_logits0, ggml_tensor * lk_logits1);

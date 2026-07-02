@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Christopher Ayers <brianboitano87@gmail.com>
 Date: Thu, 2 Jul 2026 09:06:19 -0700
-Subject: [PATCH 2/3] nvmoe: expert cache pools on the layer's device (GPU
+Subject: [PATCH 2/4] nvmoe: expert cache pools on the layer's device (GPU
  stage)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
