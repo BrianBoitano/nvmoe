@@ -87,6 +87,12 @@ MODELS = {
         expert_params=3 * 2048 * 1024, expert_bits=4.5,
         always_on_gb=0.7, kv_gb=0.5,
     ),
+    "deepseek-v2-lite": ModelPreset(
+        name="DeepSeek-V2-Lite (4.8-bit, fine-grained-routing calibration model)",
+        moe_layers=26, experts_per_layer=64, top_k=6,
+        expert_params=3 * 2048 * 1408, expert_bits=4.8,
+        always_on_gb=1.6, kv_gb=0.5,
+    ),
     "mixtral-8x7b": ModelPreset(
         name="Mixtral-8x7B (4.5-bit, calibration model)",
         moe_layers=32, experts_per_layer=8, top_k=2,

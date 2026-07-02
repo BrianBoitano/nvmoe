@@ -88,6 +88,7 @@ CUDA 12.8, `-ngl` as shown; "prefetch" = lookahead prefetch active):
 | CPU | Qwen3-30B-A3B Q4_K_M | 24 | all resident (2 pool groups, mixed Q4_K/Q6_K) | BIT-IDENTICAL |
 | CPU | Qwen3-30B-A3B Q4_K_M | 16 | 4GB + prefetch (eviction, 2 pool groups) | BIT-IDENTICAL |
 | CPU | GPT-OSS-120B MXFP4 | 12 | 8GB (63GB model, eviction) | BIT-IDENTICAL |
+| CPU | DeepSeek-V2-Lite Q4_K_M | 24 | all resident AND 2GB + prefetch (shared experts, MLA, 3 quant types) | BIT-IDENTICAL |
 | CUDA `-ngl 99` | OLMoE-1B-7B Q4_0 | 32 | all resident in VRAM | BIT-IDENTICAL |
 | CUDA `-ngl 99` | OLMoE-1B-7B Q4_0 | 32 | 512MB VRAM (heavy eviction) | BIT-IDENTICAL |
 | CUDA `-ngl 99` | OLMoE-1B-7B Q4_0 | 32 | 512MB VRAM + prefetch | BIT-IDENTICAL |
@@ -196,6 +197,35 @@ RAM story holds at 120B scale: the whole decode ran inside a
 `--memory=4g` cgroup at full speed (24.5 → 23.3 within noise), peak
 3.1GB — most of which is the one-time 2.3GB resident-weight load
 streaming through page cache.
+
+## DeepSeek-V2-Lite — third architecture, and what paging costs when you don't need it
+
+DeepSeek-V2-Lite Q4_K_M (10.4GB, 26 MoE layers × 64 experts top-6, 2
+shared experts, MLA attention, extents in two geometries and three quant
+types) validates the DeepSeek graph path end-to-end: repack 9.2s,
+byte-verified, **bit-identical logits** all-resident and under 2GB
+eviction with prefetch. The lookahead predictor's accuracy on its third
+architecture: **86.4% at top-6** (OLMoE 85.8%, Qwen3 85.9%, GPT-OSS
+84.9% — the residual-stream approximation is remarkably arch-stable).
+
+This model *fits* in 16GB, which makes it the honest measure of pack
+overhead and of fine-grained routing under pressure (tg128, `-p 0 -r 3`
+except where noted):
+
+| config | tg128 |
+|---|---|
+| stock `-ngl 99` (warm) | 269.0 ± 1.2 |
+| pack, all resident (warm) | 234.7 ± 5.3 — **paging costs ~13% when you didn't need it; use stock when the model fits** |
+| pack, 4GB cache | 32.3 ± 2.5 |
+| pack, 2GB cache | 14.6 ± 0.7 |
+
+The small-cache rows are steep because DeepSeek-style routing is flat
+(see the trace analysis in the main README): at a 2GB cache the hit rate
+is 61.5% where Qwen3's curve would predict ~85%. Prefetch measured a
+wash here (32.6 vs 32.3 at 4GB; 14.3 vs 14.6 at 2GB) with its 5-6MB
+extents sitting right at the 6MB speculation gate — a live confirmation
+that the gate's default is approximately the break-even extent size on
+the reference SSD.
 
 ## The host-RAM proof (Phase 2 headline)
 

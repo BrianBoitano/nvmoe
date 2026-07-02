@@ -120,7 +120,9 @@ works is in [docs/INTEGRATION.md](docs/INTEGRATION.md).
 
 Top-10% of experts carry 34.7% of routing traffic; consecutive tokens reuse 43.4% of their expert set. On a 16GB card, Qwen3-30B-A3B's cache holds 83% of its experts → **99.6% hit rate**: a model that doesn't fit in VRAM becomes effectively VRAM-resident.
 
-**The thrash cliff.** A cache smaller than one token's active set (`moe_layers x top_k / total_experts` — 6.3% for Qwen3-30B, only 3.1% for R1's fine-grained 256-expert design) hits exactly 0%. Fine-grained MoE has lower cliffs; any placement planner must check this floor first.
+**...but routing flatness is an architecture property.** The same four-workload trace on DeepSeek-V2-Lite (26 layers, 64 experts, top-6 — the small proxy for R1-style fine-grained routing) tells a different story: top-10% experts carry only **17.7%** of traffic, consecutive tokens reuse just **24.2%** of their experts, and the LRU curve sits roughly half as high — 23.2% hits at a 10% cache and 40.6% at 25% (vs Qwen3's 48.2% / 81.4%). Calibrated `zipf_s` drops from ~1.0 to 0.3. DeepSeek-family models pay for their fine granularity with much flatter routing: they need proportionally more cache for the same hit rate, and any R1-class plan must budget with these curves, not Qwen3's.
+
+**The thrash cliff.** A cache smaller than one token's active set (`moe_layers x top_k / total_experts` — 6.3% for Qwen3-30B, 9.4% for V2-Lite, only 3.1% for R1's fine-grained 256-expert design) hits exactly 0% — the V2-Lite trace confirms it on a second architecture (0.0% at a 5% cache). Fine-grained MoE has lower cliffs; any placement planner must check this floor first.
 
 ## Simulated decode ceilings (16GB GPU + 7GB/s NVMe)
 
@@ -138,7 +140,7 @@ Prefill is the known weak spot: a long prompt touches nearly every expert (~18s 
 ## Roadmap
 
 - [x] **Phase 0 — cache simulator** (`sim/`): presets, synthetic traces, LRU/pinned policies, tok/s ceilings
-- [x] **Phase 1 — real traces + hardware probes** (`collector/`, `tools/`): eval-callback tracer, four-workload suite, generator calibration, NVMe probe. Open item: DeepSeek-V2-Lite traces for R1-style 256-expert routing
+- [x] **Phase 1 — real traces + hardware probes** (`collector/`, `tools/`): eval-callback tracer, four-workload suite, generator calibration, NVMe probe. DeepSeek-V2-Lite traces measured 2026-07-02: fine-grained routing is ~half as cacheable as Qwen3's (see above) — the R1 planning input
 - [ ] **Phase 2 — runtime**: llama.cpp fork with an `exps=NVMe` placement path
   - [x] **2.1 offline repacker** (`tools/repack_gguf.py`): any MoE GGUF → resident GGUF + per-expert 4KB-aligned extents + manifest ([format spec](docs/PACK_FORMAT.md)); proven byte-lossless on OLMoE-1B-7B and Qwen3-30B-A3B via `tools/verify_pack.py`
   - [x] **2.2a io_uring extent reader** (`paging/`): raw-syscall io_uring + O_DIRECT benchmark on real packs — 0.7ms per expert miss, ~7GB/s @ QD2
