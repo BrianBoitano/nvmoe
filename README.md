@@ -58,6 +58,27 @@ python3 sim/run_sim.py --model qwen3-30b-a3b --trace traces/qwen3-all.tokens.jso
 python3 sim/calibrate.py --model qwen3-30b-a3b --trace traces/qwen3-all.tokens.jsonl
 ```
 
+### Optional: repack a model into an expert pack (Phase 2 has begun)
+
+The runtime doesn't page experts out of a GGUF — it pages them out of a
+**pack**: every `(layer, expert)` as its own 4KB-aligned extent (gate+up+down
+together, so a cache miss is exactly one aligned read). The repacker builds
+one from any MoE GGUF, offline, losslessly:
+
+```bash
+python3 tools/repack_gguf.py models/olmoe-q4_0.gguf
+#   -> models/olmoe-q4_0.nvmoe/{resident.gguf, experts.pack, manifest.json}
+
+# prove the repack is byte-identical to the source (every extent, every tensor)
+python3 tools/verify_pack.py models/olmoe-q4_0.nvmoe models/olmoe-q4_0.gguf
+```
+
+Measured on the reference models: OLMoE-1B-7B (Q4_0) → 1,024 extents of
+3.4MB, 92.3% of the file paged; Qwen3-30B-A3B (Q4_K_M) → 6,144 extents of
+2.5–2.9MB (mixed Q4_K/Q6_K layers), 94.6% paged. Both verify byte-identical,
+0.000% alignment padding, and the repack runs in seconds to tens of seconds.
+Format spec: [docs/PACK_FORMAT.md](docs/PACK_FORMAT.md).
+
 ## Measured results (Phase 1, reproducible with the commands above)
 
 **NVMe delivers.** Samsung 990 PRO (PCIe 4.0 x4), O_DIRECT random reads at expert-sized blocks: 4.4 GB/s at 2MB/QD1 rising to ~6-7 GB/s at 9MB+, ~8 GB/s at 2MB/QD4. Expert-granular random access costs almost nothing vs sequential.
@@ -92,7 +113,11 @@ Prefill is the known weak spot: a long prompt touches nearly every expert (~18s 
 
 - [x] **Phase 0 — cache simulator** (`sim/`): presets, synthetic traces, LRU/pinned policies, tok/s ceilings
 - [x] **Phase 1 — real traces + hardware probes** (`collector/`, `tools/`): eval-callback tracer, four-workload suite, generator calibration, NVMe probe. Open item: DeepSeek-V2-Lite traces for R1-style 256-expert routing
-- [ ] **Phase 2 — runtime**: llama.cpp fork with an `exps=NVMe` placement path — packed expert extents on disk, io_uring reader, pinned staging ring, VRAM LRU cache, router-guided prefetch
+- [ ] **Phase 2 — runtime**: llama.cpp fork with an `exps=NVMe` placement path
+  - [x] **2.1 offline repacker** (`tools/repack_gguf.py`): any MoE GGUF → resident GGUF + per-expert 4KB-aligned extents + manifest ([format spec](docs/PACK_FORMAT.md)); proven byte-lossless on OLMoE-1B-7B and Qwen3-30B-A3B via `tools/verify_pack.py`
+  - [ ] 2.2 paging library: io_uring O_DIRECT reader → pinned staging ring (≤4GB) → VRAM slab cache; standalone NVMe→VRAM microbenchmark before any llama.cpp surgery
+  - [ ] 2.3 llama.cpp integration: synchronous fetch-on-miss first (identical logits vs stock as the gate), then router-guided prefetch
+  - [ ] 2.4 measured tok/s vs stock full-VRAM on Qwen3-30B-A3B, then GPT-OSS-120B
 - [ ] **Phase 3 — planner**: probe hardware, read GGUF metadata, emit the optimal quant + placement plan per model automatically
 - [ ] **Stunt flag**: DeepSeek-R1 671B, 16GB VRAM, ≤4GB RAM, on video
 
@@ -102,10 +127,15 @@ Prefill is the known weak spot: a long prompt touches nearly every expert (~18s 
 sim/            cache simulator: presets.py, trace_gen.py, cache_sim.py,
                 run_sim.py (CLI), trace_post.py, calibrate.py
 collector/      llama.cpp trace tool (nvmoe-trace.cpp) + install.sh
-tools/          nvme_probe.py (SSD bench), collect_qwen_traces.sh
+tools/          repack_gguf.py + verify_pack.py (GGUF → expert pack, Phase 2),
+                gguf_lite.py (stdlib GGUF reader/writer),
+                nvme_probe.py (SSD bench), collect_qwen_traces.sh
+tests/          test_repack.py — full repack round-trip on a synthetic tiny
+                MoE GGUF, runs in milliseconds, no model download
 prompts/        the four standard trace workloads (ChatML format)
 traces/         real routing traces (*.tokens.jsonl committed as samples)
-docs/           DESIGN.md (architecture), TRACE_COLLECTION.md (how tracing works)
+docs/           DESIGN.md (architecture), PACK_FORMAT.md (expert pack spec),
+                TRACE_COLLECTION.md (how tracing works)
 ```
 
 ## FAQ
@@ -116,7 +146,7 @@ docs/           DESIGN.md (architecture), TRACE_COLLECTION.md (how tracing works
 
 **Will 1.58-bit quality be terrible?** 1.58-bit is the stunt tier and shows real degradation. 3-4 bit dynamic quants hold up well in public benchmarks (3-bit DeepSeek V3.1 scored 75.6% vs 76.1% unquantized on Aider Polyglot). The runtime is quant-agnostic; it pages whatever GGUF you give it.
 
-**Can I run this today?** The simulator, SSD probe, and trace collector: yes, today, that's Phases 0-1. The actual paging runtime is Phase 2 and under active development. Star/watch the repo if you want the moment it lands.
+**Can I run this today?** The simulator, SSD probe, trace collector, and the expert-pack repacker: yes, today — that's Phases 0-1 and the first piece of Phase 2. The paging runtime itself is under active development. Star/watch the repo if you want the moment it lands.
 
 **Windows/macOS?** The simulator runs anywhere Python does. The NVMe probe and the planned runtime are Linux-first (io_uring, O_DIRECT). macOS unified memory largely doesn't need this; Windows support would need a different I/O backend.
 
