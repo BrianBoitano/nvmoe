@@ -1,0 +1,212 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Ayers <brianboitano87@gmail.com>
+Date: Thu, 2 Jul 2026 09:17:35 -0700
+Subject: [PATCH 3/3] nvmoe: overlap batched miss fetches at queue depth 2-4
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The custom op now resolves all of an op's cache misses first (assigning
+and pinning victim slots), then fetches them with up to NVMOE_QD
+concurrent readers (default 4, the measured NVMe optimum for multi-MB
+extents) — each reader gets a private slice of the bounce buffer, and
+both pread and the backend tensor_set are thread-safe. Single-miss ops
+(the common warm-decode case) keep the direct path.
+
+Decode ops rarely batch more than one miss, but cold starts, prefill
+expert sweeps, and small cache budgets do. Measured on Qwen3-30B-A3B
+(CUDA, decode-only with cold start): 4GB cache 17.0 -> 21.3 tok/s
+(+25%), 8GB 47.6 -> 53.1 tok/s (+12%); OLMoE cold fill 0.64 -> 0.48s,
+heavy-eviction fetch total 2.6 -> 1.8s. Logits gates re-passed
+bit-identical on CPU and CUDA, including under eviction (fetch order
+doesn't touch values — same bytes into pinned slots).
+
+Router-logit lookahead (fetching layer L+1's experts during layer L's
+compute) remains the open prefetch stage; this change is the I/O-side
+half it will build on.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ src/llama-nvmoe.cpp | 65 ++++++++++++++++++++++++++++++++++++---------
+ src/llama-nvmoe.h   | 16 +++++++----
+ 2 files changed, 64 insertions(+), 17 deletions(-)
+
+diff --git a/src/llama-nvmoe.cpp b/src/llama-nvmoe.cpp
+index ccf8f78..2ccfaef 100644
+--- a/src/llama-nvmoe.cpp
++++ b/src/llama-nvmoe.cpp
+@@ -8,12 +8,14 @@
+ #include <unistd.h>
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cerrno>
+ #include <cinttypes>
+ #include <cstdlib>
+ #include <cstring>
+ #include <fstream>
+ #include <stdexcept>
++#include <thread>
+ 
+ using json = nlohmann::ordered_json;
+ 
+@@ -61,6 +63,10 @@ llama_nvmoe_context * llama_nvmoe_init(const std::string & pack_dir, const std::
+     ctx->n_expert      = m["model"]["n_expert"].get<int32_t>();
+     ctx->n_expert_used = m["model"]["n_expert_used"].get<int32_t>();
+ 
++    if (const char * s = getenv("NVMOE_QD")) {
++        ctx->qd = std::max(1, std::min(8, atoi(s)));
++    }
++
+     const int n_layers_total = m["model"]["n_layers_total"].get<int>();
+     ctx->layers.resize(n_layers_total);
+ 
+@@ -102,7 +108,7 @@ llama_nvmoe_context * llama_nvmoe_init(const std::string & pack_dir, const std::
+                 throw std::runtime_error("nvmoe: manifest slice_bytes mismatch for " + kname);
+             }
+         }
+-        ctx->bounce_size = std::max(ctx->bounce_size, lyr->group_stride);
++        ctx->bounce_stride = std::max(ctx->bounce_stride, lyr->group_stride);
+         ctx->layers[il] = std::move(lyr);
+     }
+ 
+@@ -275,6 +281,8 @@ llama_nvmoe_context * llama_nvmoe_init(const std::string & pack_dir, const std::
+             throw std::runtime_error("nvmoe: cannot open pack " + pack_path + ": " + strerror(errno));
+         }
+ 
++        ctx->bounce_size = ctx->bounce_stride * ctx->qd;
++
+         // pinned bounce when any pool sits on a GPU: tensor_set from pinned
+         // pages is a straight DMA, and O_DIRECT accepts them (page-aligned)
+         for (ggml_backend_dev_t dev : layer_dev) {
+@@ -325,17 +333,18 @@ ggml_tensor * llama_nvmoe_pool(const llama_nvmoe_layer * lyr, llama_nvmoe_kind k
+     return lyr->ctx->groups[lyr->group].pool[kind];
+ }
+ 
+-// fetch one expert's extent from the pack and scatter its parts into slot
+-static void llama_nvmoe_fetch(llama_nvmoe_layer * lyr, int32_t expert, int32_t slot) {
++// fetch one expert's extent from the pack and scatter its parts into slot;
++// reader selects a private slice of the bounce buffer so fetches can overlap
++static void llama_nvmoe_fetch(llama_nvmoe_layer * lyr, int32_t expert, int32_t slot, int reader) {
+     llama_nvmoe_context * nc = lyr->ctx;
+     llama_nvmoe_group   & g  = nc->groups[lyr->group];
+ 
+-    const int64_t t0 = ggml_time_us();
++    char * bounce = (char *) nc->bounce + (size_t) reader * nc->bounce_stride;
+ 
+     const uint64_t off = lyr->ext_off[expert];
+     size_t done = 0;
+     while (done < lyr->group_stride) {
+-        const ssize_t r = pread(nc->fd, (char *) nc->bounce + done, lyr->group_stride - done, off + done);
++        const ssize_t r = pread(nc->fd, bounce + done, lyr->group_stride - done, off + done);
+         if (r <= 0) {
+             GGML_ABORT("nvmoe: pack read failed at offset %" PRIu64 ": %s", off + done, r == 0 ? "eof" : strerror(errno));
+         }
+@@ -349,15 +358,19 @@ static void llama_nvmoe_fetch(llama_nvmoe_layer * lyr, int32_t expert, int32_t s
+         }
+         ggml_tensor * pool = g.pool[k];
+         // memcpy on CPU buffers, a synchronous H2D copy on device buffers
+-        ggml_backend_tensor_set(pool, (const char *) nc->bounce + p.rel_off, (size_t) slot * pool->nb[2], p.slice_bytes);
++        ggml_backend_tensor_set(pool, bounce + p.rel_off, (size_t) slot * pool->nb[2], p.slice_bytes);
+     }
+-
+-    nc->n_bytes    += lyr->group_stride;
+-    nc->t_fetch_us += ggml_time_us() - t0;
+ }
+ 
+ // the custom op: for every selected expert id, make sure the expert is
+-// resident in the pool and write out its slot index
++// resident in the pool and write out its slot index.
++//
++// Two passes: the first walks the ids, resolves hits, and assigns victim
++// slots for the distinct misses; the fetches then run with LLAMA_NVMOE_QD
++// concurrent readers (multi-MB extent reads peak at queue depth 2-4 on
++// NVMe — measured in paging/ — and both pread and cudaMemcpy are
++// thread-safe). Decode ops rarely miss more than once, but cold starts,
++// prefill sweeps, and small cache budgets batch many misses per op.
+ static void llama_nvmoe_fetch_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+     GGML_UNUSED(nth);
+     if (ith != 0) {
+@@ -376,6 +389,8 @@ static void llama_nvmoe_fetch_op(ggml_tensor * dst, const ggml_tensor * a, int i
+     const int32_t * ids = (const int32_t *) a->data;
+     int32_t       * out = (int32_t *) dst->data;
+ 
++    std::vector<std::pair<int32_t, int32_t>> misses; // (expert, slot)
++
+     for (int64_t i = 0; i < n; i++) {
+         const int32_t e = ids[i];
+         GGML_ASSERT(e >= 0 && e < nc->n_expert);
+@@ -409,10 +424,10 @@ static void llama_nvmoe_fetch_op(ggml_tensor * dst, const ggml_tensor * a, int i
+                 g.where.erase(g.slot_key[slot]);
+             }
+ 
+-            llama_nvmoe_fetch(lyr, e, slot);
+-
+             g.slot_key[slot] = key;
+             g.where[key]     = slot;
++
++            misses.emplace_back(e, slot);
+         }
+ 
+         nc->n_ref++;
+@@ -421,6 +436,32 @@ static void llama_nvmoe_fetch_op(ggml_tensor * dst, const ggml_tensor * a, int i
+ 
+         out[i] = slot;
+     }
++
++    if (misses.empty()) {
++        return;
++    }
++
++    const int64_t t0 = ggml_time_us();
++    if (misses.size() == 1) {
++        llama_nvmoe_fetch(lyr, misses[0].first, misses[0].second, 0);
++    } else {
++        const int n_readers = std::min<int>(nc->qd, (int) misses.size());
++        std::vector<std::thread> readers;
++        std::atomic<size_t> next(0);
++        for (int r = 0; r < n_readers; r++) {
++            readers.emplace_back([&, r]() {
++                for (size_t m; (m = next.fetch_add(1)) < misses.size(); ) {
++                    llama_nvmoe_fetch(lyr, misses[m].first, misses[m].second, r);
++                }
++            });
++        }
++        for (auto & t : readers) {
++            t.join();
++        }
++    }
++    // wall time, not per-reader time, when fetches overlap
++    nc->t_fetch_us += ggml_time_us() - t0;
++    nc->n_bytes    += misses.size() * lyr->group_stride;
+ }
+ 
+ ggml_tensor * llama_nvmoe_ids_remap(ggml_context * ctx0, llama_nvmoe_layer * lyr, ggml_tensor * selected_experts) {
+diff --git a/src/llama-nvmoe.h b/src/llama-nvmoe.h
+index 282f986..e9478ed 100644
+--- a/src/llama-nvmoe.h
++++ b/src/llama-nvmoe.h
+@@ -95,12 +95,18 @@ struct llama_nvmoe_context {
+     std::vector<ggml_context_ptr>        ctx_pools;
+     std::vector<ggml_backend_buffer_ptr> buf_pools;
+ 
+-    // O_DIRECT-aligned bounce buffer, large enough for the largest extent;
+-    // allocated pinned (device host-buffer type) when any pool is on a GPU
++    // O_DIRECT-aligned bounce buffer: qd slices of the largest extent size,
++    // one per concurrent reader; allocated pinned (device host-buffer type)
++    // when any pool is on a GPU
+     ggml_backend_buffer_ptr buf_bounce;
+-    void * bounce       = nullptr;
+-    size_t bounce_size  = 0;
+-    bool   bounce_owned = false; // true when malloc'd (free in dtor)
++    void * bounce        = nullptr;
++    size_t bounce_stride = 0; // bytes per reader slice
++    size_t bounce_size   = 0; // bounce_stride * qd
++    bool   bounce_owned  = false; // true when malloc'd (free in dtor)
++
++    // concurrent readers for batched misses (NVMOE_QD, default 4 — extent
++    // reads peak at queue depth 2-4, see paging/)
++    int qd = 4;
+ 
+     uint64_t tick  = 0; // LRU clock
+     uint64_t epoch = 0; // custom-op invocation counter (for per-op pinning)

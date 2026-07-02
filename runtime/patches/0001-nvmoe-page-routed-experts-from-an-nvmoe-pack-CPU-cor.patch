@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Christopher Ayers <brianboitano87@gmail.com>
 Date: Thu, 2 Jul 2026 08:45:52 -0700
-Subject: [PATCH 1/2] nvmoe: page routed experts from an nvmoe pack (CPU
+Subject: [PATCH 1/3] nvmoe: page routed experts from an nvmoe pack (CPU
  correctness stage)
 
 Loading a pack's resident.gguf (detected via the nvmoe.pack.version KV)

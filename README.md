@@ -6,7 +6,7 @@ Modern flagship open-weight models (DeepSeek-R1 671B, Qwen3-Next-80B, GPT-OSS-12
 
 ## Who is this for
 
-- **You have a 8-24GB GPU and want to run models that don't fit.** The measured result below shows a model slightly too big for VRAM running at a 99.6% cache hit rate — effectively VRAM speed.
+- **You have a 8-24GB GPU and want to run models that don't fit.** Measured, not simulated: Qwen3-30B-A3B (18.6GB, doesn't fit a 16GB card) decodes at **166 tok/s** from its NVMe pack — 2.1x the best llama.cpp offload split — using 756MB of host RAM ([tables](runtime/README.md)).
 - **You want the big ones.** DeepSeek-R1 671B (dynamic 1.58-bit, 131GB on disk) pencils out to ~2 tok/s on a 16GB card + consumer SSD. Slow, but it *runs*, on hardware that costs less than the RAM other approaches require.
 - **Your RAM is spoken for.** Every existing offload system (KTransformers, Fiddler, llama.cpp's `exps=CPU`) parks expert weights in system RAM. If your machine runs a Docker stack, a game, or VMs, that RAM isn't free. nvmoe bypasses the page cache entirely (O_DIRECT) and caps host memory use.
 
@@ -101,6 +101,8 @@ works is in [docs/INTEGRATION.md](docs/INTEGRATION.md).
 
 ## Measured results (reproducible with the commands above)
 
+**The runtime works, end to end.** Qwen3-30B-A3B Q4_K_M (18.6GB GGUF, does not fit in 16GB VRAM) decodes at **166.1 ± 2.2 tok/s** from its pack with a 12GB VRAM expert cache and synchronous fetch-on-miss — vs 79.2 for stock llama.cpp's best partial offload and 45.2 for the experts-in-RAM recipe (which needs ~17GB of free host RAM; nvmoe used **756MB peak, measured inside a hard 4GB cgroup**). Cache-budget sweep, prefill caveat, and every command: [runtime/README.md](runtime/README.md). Correctness bar: **bit-identical logits vs stock**, CPU and CUDA, including under heavy cache eviction.
+
 **NVMe delivers.** Samsung 990 PRO (PCIe 4.0 x4), O_DIRECT random reads at expert-sized blocks: 4.4 GB/s at 2MB/QD1 rising to ~6-7 GB/s at 9MB+, ~8 GB/s at 2MB/QD4. Expert-granular random access costs almost nothing vs sequential.
 
 **A cache miss costs ~0.7ms — disk all the way into VRAM.** io_uring + O_DIRECT random extent fetches from real repacked expert packs (`paging/nvmoe-iobench`), measured both into host RAM and end-to-end into a VRAM slab (`--gpu`: pinned staging + `cudaMemcpyHtoDAsync`, byte-verified): p50 0.7ms / p99 ~1ms per expert at QD1, peaking at **~7 GB/s and ~2,300 experts/s at QD2**, with the GPU hop costing only 2-5% (PCIe hides behind the NVMe reads — the SSD stays the bottleneck, as designed). ~220MB of pinned host RAM sustained the peak: the ≤4GB budget has 10x headroom. One surprise: throughput *falls* past QD4 (multi-MB reads are already parallel inside the SSD), so the prefetcher design keeps 2-4 reads in flight, not the 16-32 first guessed. Details + full tables: [paging/README.md](paging/README.md).
@@ -141,8 +143,8 @@ Prefill is the known weak spot: a long prompt touches nearly every expert (~18s 
   - [x] **2.2b NVMe→VRAM end-to-end** (`--gpu`): pinned staging + async H2D into a VRAM slab, byte-verified — the GPU hop costs 2-5%; ~6.6GB/s / ~2,300 experts/s to VRAM on ~220MB of host RAM. No CUDA toolkit needed (driver API via dlopen)
   - [x] **2.3a llama.cpp integration, CPU correctness** (`runtime/`): pack loading + expert-cache pools + sync fetch-on-miss behind an unchanged `ggml_mul_mat_id`; gate = **bit-identical logits vs stock** on OLMoE-1B-7B and Qwen3-30B-A3B, including under heavy cache eviction ([how it hooks in](docs/INTEGRATION.md))
   - [x] **2.3b GPU path**: pools live on the layer's device (VRAM under `-ngl`, split per device on partial offload), fetches DMA through a pinned bounce — pure ggml-backend API, no CUDA code in the runtime; **bit-identical logits on the CUDA backend** (full offload, heavy VRAM eviction, and mixed CPU+GPU pools)
-  - [ ] 2.3c router-guided prefetch at QD 2-4, overlapped with compute
-  - [ ] 2.4 measured tok/s vs stock full-VRAM on Qwen3-30B-A3B, then GPT-OSS-120B
+  - [x] **2.3c(i) overlapped miss fetches**: an op's batched misses fetch at QD 2-4 (the measured optimum) — +25% decode at a 4GB cache, logits still bit-identical. Open: router-logit lookahead (fetch layer L+1's experts during layer L's compute)
+  - [x] **2.4 measured tok/s on Qwen3-30B-A3B** ([tables + commands](runtime/README.md)): **166 tok/s decode from the pack at a 12GB VRAM cache — 2.1x the best stock offload split, 3.7x the exps-in-RAM recipe — with 756MB peak host RAM, proven inside a hard 4GB cgroup.** Open: GPT-OSS-120B (~61GB download)
 - [ ] **Phase 3 — planner**: probe hardware, read GGUF metadata, emit the optimal quant + placement plan per model automatically
 - [ ] **Stunt flag**: DeepSeek-R1 671B, 16GB VRAM, ≤4GB RAM, on video
 

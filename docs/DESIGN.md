@@ -91,10 +91,11 @@ k layers ahead so I/O overlaps attention/dense compute)
 ### RAM budget enforcement
 
 Everything host-side lives in one allocation domain: staging ring + manifest +
-predictor state. CI target: run under `systemd-run --scope -p MemoryMax=4G`
-(or a Docker `--memory=4g` container) as proof, and document it. This is a
-headline feature, not an implementation detail — "runs with Docker eating the
-rest of your RAM" is the differentiator vs every exps=CPU setup.
+predictor state. This is a headline feature, not an implementation detail —
+"runs with Docker eating the rest of your RAM" is the differentiator vs every
+exps=CPU setup. **Proven (Phase 2.4):** the full Qwen3-30B decode runs inside
+a Docker `--memory=4g --memory-swap=4g` cgroup at full speed with a measured
+peak of 756MB host memory (see runtime/README.md for the command).
 
 ## What nvmoe is NOT
 
