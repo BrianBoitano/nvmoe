@@ -140,7 +140,7 @@ Prefill is the known weak spot: a long prompt touches nearly every expert (~18s 
   - [x] **2.2a io_uring extent reader** (`paging/`): raw-syscall io_uring + O_DIRECT benchmark on real packs — 0.7ms per expert miss, ~7GB/s @ QD2
   - [x] **2.2b NVMe→VRAM end-to-end** (`--gpu`): pinned staging + async H2D into a VRAM slab, byte-verified — the GPU hop costs 2-5%; ~6.6GB/s / ~2,300 experts/s to VRAM on ~220MB of host RAM. No CUDA toolkit needed (driver API via dlopen)
   - [x] **2.3a llama.cpp integration, CPU correctness** (`runtime/`): pack loading + expert-cache pools + sync fetch-on-miss behind an unchanged `ggml_mul_mat_id`; gate = **bit-identical logits vs stock** on OLMoE-1B-7B and Qwen3-30B-A3B, including under heavy cache eviction ([how it hooks in](docs/INTEGRATION.md))
-  - [ ] 2.3b GPU path: expert pools in VRAM, fetches via the measured 2.2b pipeline; same logits gate on the CUDA backend
+  - [x] **2.3b GPU path**: pools live on the layer's device (VRAM under `-ngl`, split per device on partial offload), fetches DMA through a pinned bounce — pure ggml-backend API, no CUDA code in the runtime; **bit-identical logits on the CUDA backend** (full offload, heavy VRAM eviction, and mixed CPU+GPU pools)
   - [ ] 2.3c router-guided prefetch at QD 2-4, overlapped with compute
   - [ ] 2.4 measured tok/s vs stock full-VRAM on Qwen3-30B-A3B, then GPT-OSS-120B
 - [ ] **Phase 3 — planner**: probe hardware, read GGUF metadata, emit the optimal quant + placement plan per model automatically

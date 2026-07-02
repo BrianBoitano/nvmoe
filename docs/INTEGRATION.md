@@ -32,16 +32,23 @@ tensor-loading code funnels through, so no per-arch edits are needed. The
 loader's `n_created == n_tensors` accounting stays balanced because the
 paged tensors aren't in the file's tensor count either.
 
-**3. The runtime — `src/llama-nvmoe.{h,cpp}`** (new, ~350 lines). Owns:
+**3. The runtime — `src/llama-nvmoe.{h,cpp}`** (new, ~400 lines). Owns:
 - the parsed manifest (geometry per layer, extent offsets per expert),
-- **pool tensors**, one per matrix kind per *geometry group* (layers whose
-  gate/up/down types+shapes match share pools and cache slots — Qwen3-30B's
-  Q4_K_M has two groups because half its layers quantize to Q6_K),
+- **pool tensors**, one per matrix kind per *(geometry, buffer type) group*
+  (layers whose gate/up/down types+shapes match share pools and cache slots
+  — Qwen3-30B's Q4_K_M has two geometry groups because half its layers
+  quantize to Q6_K). Each pool lives in the buffer type of the device that
+  runs its layer: full offload → VRAM, partial offload → split per device,
 - the **LRU cache** keyed `(layer, expert) → slot`, with per-op pinning so
   an expert fetched for the current `mul_mat_id` can't be evicted by a
   later miss in the same op,
 - the **fetch path**: one O_DIRECT `pread` of the expert's extent into an
-  aligned bounce buffer, then a memcpy per matrix kind into the pool slots.
+  aligned bounce buffer, then `ggml_backend_tensor_set` per matrix kind
+  into the pool slots — a memcpy on CPU pools, a synchronous H2D copy on
+  device pools. When any pool is on a GPU the bounce buffer comes from the
+  device's *host buffer type* (pinned), so the copies are straight DMA and
+  O_DIRECT accepts the pages. No CUDA API appears anywhere in the runtime;
+  the same code serves every backend ggml has.
   An expert occupies the same slot index in all three pools (gate/up share
   shape; down is transposed but same nbytes), so one id remap serves all
   three matmuls.
@@ -106,5 +113,6 @@ does the same job and works).
   guarantees correctness, not speed, for big ubatches.
 - The custom op runs on the CPU backend even in GPU builds (ggml custom ops
   are CPU-only). That is *correct* by construction — the scheduler copies
-  the tiny ids tensor to host and back — and it is exactly where the 2.3b
-  GPU stage will issue its H2D copies from.
+  the tiny ids tensor to host and back — and it is where the fetch issues
+  its H2D copies from. It does cost graph splits (two per MoE layer), which
+  disables CUDA graphs; the prefetch stage is the right place to revisit.

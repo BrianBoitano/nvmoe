@@ -1,0 +1,309 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Ayers <brianboitano87@gmail.com>
+Date: Thu, 2 Jul 2026 09:06:19 -0700
+Subject: [PATCH 2/2] nvmoe: expert cache pools on the layer's device (GPU
+ stage)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Pool tensors now live in the buffer type of the device that runs their
+layer: full offload puts them in VRAM, partial offload splits pool
+groups per device (grouping key = geometry + buffer type). The fetch
+path is unchanged logic through the backend API — one O_DIRECT pread
+into the bounce buffer, then ggml_backend_tensor_set per matrix kind,
+which is a memcpy on CPU pools and a synchronous H2D copy on device
+pools. When any pool is on a GPU the bounce buffer is allocated from
+the device's host buffer type (pinned), so the H2D copies are straight
+DMA and O_DIRECT still accepts the pages. No CUDA API appears in the
+runtime; the same code serves every backend.
+
+Gate results on the CUDA backend (RTX 5070 Ti, CUDA 12.8, sm_120),
+stock GGUF vs pack, llama-nvmoe-logits + compare_logits.py:
+
+  OLMoE-1B-7B  -ngl 99  all resident            BIT-IDENTICAL (32 steps)
+  OLMoE-1B-7B  -ngl 99  NVMOE_CACHE_MB=512      BIT-IDENTICAL (34% hit,
+                                                heavy eviction via VRAM)
+  OLMoE-1B-7B  -ngl 8   CPU+CUDA pools mixed    BIT-IDENTICAL
+
+CPU-only regression re-passed after the refactor. Fetch of 2.4GB of
+cold experts into VRAM took 0.63s (~3.8GB/s through the pinned bounce
+at QD1) vs 1.7s for the CPU memcpy path.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ src/llama-model.cpp |   6 ++-
+ src/llama-nvmoe.cpp | 124 ++++++++++++++++++++++++++++++++------------
+ src/llama-nvmoe.h   |  25 ++++++---
+ 3 files changed, 113 insertions(+), 42 deletions(-)
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 9d492f6..f5b4268 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1631,7 +1631,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         if (const char * s = getenv("NVMOE_CACHE_MB")) {
+             cache_bytes = strtoll(s, nullptr, 10) * 1024 * 1024;
+         }
+-        nvmoe.reset(llama_nvmoe_init(ml.nvmoe_dir, ml.nvmoe_manifest, cache_bytes));
++        std::vector<ggml_backend_dev_t> layer_dev(n_layer_all);
++        for (int il = 0; il < n_layer_all; ++il) {
++            layer_dev[il] = pimpl->dev_layer[il].dev;
++        }
++        nvmoe.reset(llama_nvmoe_init(ml.nvmoe_dir, ml.nvmoe_manifest, cache_bytes, layer_dev));
+     }
+ 
+     return true;
+diff --git a/src/llama-nvmoe.cpp b/src/llama-nvmoe.cpp
+index 8ff09a6..ccf8f78 100644
+--- a/src/llama-nvmoe.cpp
++++ b/src/llama-nvmoe.cpp
+@@ -7,6 +7,7 @@
+ #include <fcntl.h>
+ #include <unistd.h>
+ 
++#include <algorithm>
+ #include <cerrno>
+ #include <cinttypes>
+ #include <cstdlib>
+@@ -31,10 +32,13 @@ llama_nvmoe_context::~llama_nvmoe_context() {
+     if (fd >= 0) {
+         close(fd);
+     }
+-    free(bounce);
++    if (bounce_owned) {
++        free(bounce);
++    }
+ }
+ 
+-llama_nvmoe_context * llama_nvmoe_init(const std::string & pack_dir, const std::string & manifest_name, int64_t cache_bytes) {
++llama_nvmoe_context * llama_nvmoe_init(const std::string & pack_dir, const std::string & manifest_name, int64_t cache_bytes,
++        const std::vector<ggml_backend_dev_t> & layer_dev) {
+     auto ctx = std::make_unique<llama_nvmoe_context>();
+     ctx->dir = pack_dir;
+ 
+@@ -113,9 +117,22 @@ llama_nvmoe_context * llama_nvmoe_init(const std::string & pack_dir, const std::
+         ctx->layers[il]->ext_off[e] = off;
+     }
+ 
+-    // geometry groups: layers whose parts all match share pools and cache slots
++    // the buffer type each layer's pool must live in (same device as the
++    // layer's other weights, so mul_mat_id runs where the layer runs)
++    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++    auto buft_for_layer = [&](int il) -> ggml_backend_buffer_type_t {
++        ggml_backend_dev_t dev = (size_t) il < layer_dev.size() && layer_dev[il] ? layer_dev[il] : cpu_dev;
++        if (dev == cpu_dev) {
++            return ggml_backend_cpu_buffer_type();
++        }
++        return ggml_backend_dev_buffer_type(dev);
++    };
++
++    // geometry groups: layers whose parts all match and that target the same
++    // buffer type share pools and cache slots
+     struct sig_entry {
+         llama_nvmoe_part parts[LLAMA_NVMOE_KIND_COUNT];
++        ggml_backend_buffer_type_t buft;
+         int group;
+         int n_layers;
+     };
+@@ -124,9 +141,10 @@ llama_nvmoe_context * llama_nvmoe_init(const std::string & pack_dir, const std::
+         if (!lyr) {
+             continue;
+         }
++        ggml_backend_buffer_type_t buft = buft_for_layer(lyr->il);
+         int found = -1;
+         for (auto & s : sigs) {
+-            bool same = true;
++            bool same = s.buft == buft;
+             for (int k = 0; k < LLAMA_NVMOE_KIND_COUNT && same; k++) {
+                 const auto & a = s.parts[k];
+                 const auto & b = lyr->parts[k];
+@@ -141,6 +159,7 @@ llama_nvmoe_context * llama_nvmoe_init(const std::string & pack_dir, const std::
+             found = (int) sigs.size();
+             sig_entry s = {};
+             memcpy(s.parts, lyr->parts, sizeof(s.parts));
++            s.buft     = buft;
+             s.group    = found;
+             s.n_layers = 0;
+             sigs.push_back(s);
+@@ -185,42 +204,59 @@ llama_nvmoe_context * llama_nvmoe_init(const std::string & pack_dir, const std::
+         g.slot_key .assign(g.n_slots, -1);
+         g.slot_used.assign(g.n_slots,  0);
+         g.slot_op  .assign(g.n_slots,  0);
++        g.buft = s.buft;
+     }
+ 
+-    // pool tensors, allocated in one CPU buffer
++    // pool tensors, one context + backend buffer per buffer type
+     {
+-        const size_t n_pools = sigs.size() * LLAMA_NVMOE_KIND_COUNT;
+-        ggml_init_params ip = {
+-            /*.mem_size   =*/ ggml_tensor_overhead() * n_pools,
+-            /*.mem_buffer =*/ nullptr,
+-            /*.no_alloc   =*/ true,
+-        };
+-        ctx->ctx_pools.reset(ggml_init(ip));
+-        if (!ctx->ctx_pools) {
+-            throw std::runtime_error("nvmoe: failed to create pool context");
++        std::vector<ggml_backend_buffer_type_t> bufts;
++        for (auto & s : sigs) {
++            if (std::find(bufts.begin(), bufts.end(), s.buft) == bufts.end()) {
++                bufts.push_back(s.buft);
++            }
+         }
+ 
+-        for (auto & s : sigs) {
+-            auto & g = ctx->groups[s.group];
+-            for (int k = 0; k < LLAMA_NVMOE_KIND_COUNT; k++) {
+-                if (!s.parts[k].present) {
++        for (auto buft : bufts) {
++            const size_t n_pools = sigs.size() * LLAMA_NVMOE_KIND_COUNT;
++            ggml_init_params ip = {
++                /*.mem_size   =*/ ggml_tensor_overhead() * n_pools,
++                /*.mem_buffer =*/ nullptr,
++                /*.no_alloc   =*/ true,
++            };
++            ggml_context_ptr pctx { ggml_init(ip) };
++            if (!pctx) {
++                throw std::runtime_error("nvmoe: failed to create pool context");
++            }
++
++            for (auto & s : sigs) {
++                if (s.buft != buft) {
+                     continue;
+                 }
+-                ggml_tensor * t = ggml_new_tensor_3d(ctx->ctx_pools.get(), s.parts[k].type, s.parts[k].ne0, s.parts[k].ne1, g.n_slots);
+-                ggml_format_name(t, "nvmoe_pool_g%d.%s", s.group, llama_nvmoe_kind_names[k]);
+-                g.pool[k] = t;
++                auto & g = ctx->groups[s.group];
++                for (int k = 0; k < LLAMA_NVMOE_KIND_COUNT; k++) {
++                    if (!s.parts[k].present) {
++                        continue;
++                    }
++                    ggml_tensor * t = ggml_new_tensor_3d(pctx.get(), s.parts[k].type, s.parts[k].ne0, s.parts[k].ne1, g.n_slots);
++                    ggml_format_name(t, "nvmoe_pool_g%d.%s", s.group, llama_nvmoe_kind_names[k]);
++                    g.pool[k] = t;
++                }
+             }
+-        }
+ 
+-        ctx->buf_pools.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx->ctx_pools.get(), ggml_backend_cpu_buffer_type()));
+-        if (!ctx->buf_pools) {
+-            throw std::runtime_error("nvmoe: failed to allocate pool buffers");
+-        }
+-        ggml_backend_buffer_set_usage(ctx->buf_pools.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++            ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(pctx.get(), buft) };
++            if (!buf) {
++                throw std::runtime_error(std::string("nvmoe: failed to allocate pool buffer in ") + ggml_backend_buft_name(buft));
++            }
++            ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+ 
+-        LLAMA_LOG_INFO("nvmoe: %zu pool group(s), %8.2f MiB expert cache (%s)\n",
+-                sigs.size(), ggml_backend_buffer_get_size(ctx->buf_pools.get()) / 1024.0 / 1024.0,
+-                cache_bytes > 0 ? "budgeted" : "all experts resident");
++            LLAMA_LOG_INFO("nvmoe: %8.2f MiB expert cache in %s (%s)\n",
++                    ggml_backend_buffer_get_size(buf.get()) / 1024.0 / 1024.0,
++                    ggml_backend_buft_name(buft),
++                    cache_bytes > 0 ? "budgeted" : "all experts resident");
++
++            ctx->ctx_pools.emplace_back(std::move(pctx));
++            ctx->buf_pools.emplace_back(std::move(buf));
++        }
+     }
+ 
+     // pack file + bounce buffer
+@@ -239,8 +275,29 @@ llama_nvmoe_context * llama_nvmoe_init(const std::string & pack_dir, const std::
+             throw std::runtime_error("nvmoe: cannot open pack " + pack_path + ": " + strerror(errno));
+         }
+ 
+-        if (posix_memalign(&ctx->bounce, ctx->alignment, ctx->bounce_size) != 0) {
+-            throw std::runtime_error("nvmoe: failed to allocate bounce buffer");
++        // pinned bounce when any pool sits on a GPU: tensor_set from pinned
++        // pages is a straight DMA, and O_DIRECT accepts them (page-aligned)
++        for (ggml_backend_dev_t dev : layer_dev) {
++            if (!dev || dev == cpu_dev) {
++                continue;
++            }
++            ggml_backend_buffer_type_t hbuft = ggml_backend_dev_host_buffer_type(dev);
++            if (!hbuft) {
++                continue;
++            }
++            ctx->buf_bounce.reset(ggml_backend_buft_alloc_buffer(hbuft, ctx->bounce_size));
++            if (ctx->buf_bounce) {
++                ctx->bounce = ggml_backend_buffer_get_base(ctx->buf_bounce.get());
++                LLAMA_LOG_INFO("nvmoe: %6.1f MiB pinned bounce buffer (%s)\n",
++                        ctx->bounce_size / 1024.0 / 1024.0, ggml_backend_buft_name(hbuft));
++            }
++            break;
++        }
++        if (!ctx->bounce) {
++            if (posix_memalign(&ctx->bounce, ctx->alignment, ctx->bounce_size) != 0) {
++                throw std::runtime_error("nvmoe: failed to allocate bounce buffer");
++            }
++            ctx->bounce_owned = true;
+         }
+ 
+         // header read is one aligned block, so it works under O_DIRECT too
+@@ -291,7 +348,8 @@ static void llama_nvmoe_fetch(llama_nvmoe_layer * lyr, int32_t expert, int32_t s
+             continue;
+         }
+         ggml_tensor * pool = g.pool[k];
+-        memcpy((char *) pool->data + (size_t) slot * pool->nb[2], (const char *) nc->bounce + p.rel_off, p.slice_bytes);
++        // memcpy on CPU buffers, a synchronous H2D copy on device buffers
++        ggml_backend_tensor_set(pool, (const char *) nc->bounce + p.rel_off, (size_t) slot * pool->nb[2], p.slice_bytes);
+     }
+ 
+     nc->n_bytes    += lyr->group_stride;
+diff --git a/src/llama-nvmoe.h b/src/llama-nvmoe.h
+index f0c638b..282f986 100644
+--- a/src/llama-nvmoe.h
++++ b/src/llama-nvmoe.h
+@@ -61,8 +61,12 @@ struct llama_nvmoe_layer {
+     std::vector<uint64_t> ext_off; // absolute pack offset per expert
+ };
+ 
+-// layers with identical part geometry share pool tensors and cache slots
++// layers with identical part geometry AND the same target buffer type share
++// pool tensors and cache slots (partial offload puts CPU-resident layers'
++// pools on the CPU and GPU-resident layers' pools in VRAM)
+ struct llama_nvmoe_group {
++    ggml_backend_buffer_type_t buft = nullptr;
++
+     ggml_tensor * pool[LLAMA_NVMOE_KIND_COUNT] = {};
+ 
+     int32_t n_slots = 0;
+@@ -87,13 +91,16 @@ struct llama_nvmoe_context {
+     std::vector<std::unique_ptr<llama_nvmoe_layer>> layers; // indexed by il, null for non-MoE layers
+     std::vector<llama_nvmoe_group> groups;
+ 
+-    // pool tensor storage (host memory in the CPU correctness path)
+-    ggml_context_ptr           ctx_pools;
+-    ggml_backend_buffer_ptr    buf_pools;
++    // pool tensor storage, one context+buffer per buffer type
++    std::vector<ggml_context_ptr>        ctx_pools;
++    std::vector<ggml_backend_buffer_ptr> buf_pools;
+ 
+-    // O_DIRECT-aligned bounce buffer, large enough for the largest extent
+-    void * bounce      = nullptr;
+-    size_t bounce_size = 0;
++    // O_DIRECT-aligned bounce buffer, large enough for the largest extent;
++    // allocated pinned (device host-buffer type) when any pool is on a GPU
++    ggml_backend_buffer_ptr buf_bounce;
++    void * bounce       = nullptr;
++    size_t bounce_size  = 0;
++    bool   bounce_owned = false; // true when malloc'd (free in dtor)
+ 
+     uint64_t tick  = 0; // LRU clock
+     uint64_t epoch = 0; // custom-op invocation counter (for per-op pinning)
+@@ -108,8 +115,10 @@ struct llama_nvmoe_context {
+ };
+ 
+ // load manifest + open pack; cache_bytes <= 0 means "all experts resident".
++// layer_dev[il] = device whose buffers hold layer il's weights (empty: CPU).
+ // throws std::runtime_error on any problem.
+-llama_nvmoe_context * llama_nvmoe_init(const std::string & pack_dir, const std::string & manifest_name, int64_t cache_bytes);
++llama_nvmoe_context * llama_nvmoe_init(const std::string & pack_dir, const std::string & manifest_name, int64_t cache_bytes,
++        const std::vector<ggml_backend_dev_t> & layer_dev);
+ 
+ // per-layer handle for graph building; null if il is not a paged MoE layer
+ llama_nvmoe_layer * llama_nvmoe_get_layer(const llama_nvmoe_context * ctx, int il);

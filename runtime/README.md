@@ -8,7 +8,16 @@ teaches it to load an nvmoe pack and page routed experts from NVMe. See
 ./runtime/apply.sh              # clone + apply -> ./llama.cpp-nvmoe (branch "nvmoe")
 cd llama.cpp-nvmoe
 cmake -B build && cmake --build build -j --target llama-nvmoe-logits llama-bench
+
+# CUDA build (needs the toolkit; a nvidia/cuda:12.8+-devel container works):
+cmake -B build-cuda -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native
+cmake --build build-cuda -j --target llama-nvmoe-logits llama-bench
 ```
+
+With a GPU build and `-ngl`, the expert cache pools live in **VRAM** and
+misses stream NVMe → pinned bounce → VRAM; partial offload splits the pools
+per device. Same code path either way — the runtime talks only to the
+ggml-backend API.
 
 No new flags: point any tool at a pack's `resident.gguf` and the pack is
 detected from its `nvmoe.pack.version` KV.
@@ -33,14 +42,18 @@ python3 tools/compare_logits.py /tmp/stock.bin /tmp/pack.bin
 # PASS: 32 steps, 50304 logits/step -- BIT-IDENTICAL
 ```
 
-Verified 2026-07-02 (CPU backend, this exact procedure):
+Verified 2026-07-02 (this exact procedure; GPU rows on an RTX 5070 Ti,
+CUDA 12.8, `-ngl` as shown):
 
-| model | steps | cache | result |
-|---|---|---|---|
-| OLMoE-1B-7B Q4_0 | 32 | all resident | BIT-IDENTICAL |
-| OLMoE-1B-7B Q4_0 | 32 | 512MB (35.6% hit, heavy eviction) | BIT-IDENTICAL |
-| OLMoE-1B-7B Q4_0 | 48, second prompt | all resident | BIT-IDENTICAL |
-| Qwen3-30B-A3B Q4_K_M | 24 | all resident (2 pool groups, mixed Q4_K/Q6_K) | BIT-IDENTICAL |
+| backend | model | steps | cache | result |
+|---|---|---|---|---|
+| CPU | OLMoE-1B-7B Q4_0 | 32 | all resident | BIT-IDENTICAL |
+| CPU | OLMoE-1B-7B Q4_0 | 32 | 512MB (35.6% hit, heavy eviction) | BIT-IDENTICAL |
+| CPU | OLMoE-1B-7B Q4_0 | 48, second prompt | all resident | BIT-IDENTICAL |
+| CPU | Qwen3-30B-A3B Q4_K_M | 24 | all resident (2 pool groups, mixed Q4_K/Q6_K) | BIT-IDENTICAL |
+| CUDA `-ngl 99` | OLMoE-1B-7B Q4_0 | 32 | all resident in VRAM | BIT-IDENTICAL |
+| CUDA `-ngl 99` | OLMoE-1B-7B Q4_0 | 32 | 512MB VRAM (34% hit, heavy eviction) | BIT-IDENTICAL |
+| CUDA `-ngl 8` | OLMoE-1B-7B Q4_0 | 32 | pools split CPU + VRAM | BIT-IDENTICAL |
 
 The gate tool disables CPU weight repacking (`use_extra_bufts = false`):
 the repacked interleaved kernels sum in a different order than the plain
