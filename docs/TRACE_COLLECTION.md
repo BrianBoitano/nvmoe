@@ -26,9 +26,31 @@ final layer only for output rows, so that layer's record has a smaller
 token positions. Related tensor for the Phase 2 prefetch predictor:
 `ffn_moe_probs-<il>` (router probabilities).
 
+Two collector gotchas learned on GPT-OSS-120B (both fixed in the tool):
+`ffn_moe_topk` is a strided *view* of the argsort tensor, so a flat read
+garbles any multi-token (prefill) record — the collector reads row by row
+through `nb[1]`; and the name match must be exact (`ffn_moe_topk-<digits>`),
+because nvmoe pack graphs also carry `ffn_moe_topk_nvmoe-<il>` (cache-slot
+ids, not expert ids) which a prefix match happily logs as a duplicate layer.
+
 `tools/collect_qwen_traces.sh` runs the standard four-workload suite.
 `sim/calibrate.py` fits the synthetic generator to a real trace and reports
 the real-vs-synthetic LRU hit-rate curve.
+
+## Tracing models too big for CPU (GPU + pack)
+
+A 63GB model decodes unusably slowly on CPU, but its routing is observable
+at full pack speed: point the collector at an **nvmoe pack** with `-ngl 99`.
+Pack routing is bit-identical to stock (that's the runtime's correctness
+gate), so the trace is too, and the whole four-workload suite runs in ~4
+minutes on the reference box. That is how the GPT-OSS-120B trace
+(`traces/gptoss-all.tokens.jsonl`) was collected:
+
+```bash
+BIN=<fork>/build-cuda/bin/llama-nvmoe-trace \
+MODEL=models/gpt-oss-120b-mxfp4.nvmoe/resident.gguf \
+PREFIX=gptoss NGL=99 NVMOE_CACHE_MB=11264 bash tools/collect_qwen_traces.sh
+```
 
 ## Calibration models for the PlexyLady box (no dedicated RAM)
 

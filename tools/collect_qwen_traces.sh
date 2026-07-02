@@ -10,10 +10,14 @@
 # Works with any MoE GGUF — smaller models (OLMoE, Qwen3-30B-A3B,
 # DeepSeek-V2-Lite) trace fine on CPU; no GPU required.
 # PREFIX names the output files (traces/$PREFIX-<workload>.raw.jsonl).
+# NGL offloads layers to the GPU — the way to trace models too big for CPU:
+# point MODEL at an nvmoe pack's resident.gguf (pack routing is bit-identical
+# to stock, so the trace is too) and the collector runs at pack decode speed.
 set -e
 BIN=${BIN:-llama-nvmoe-trace}
 MODEL=${MODEL:?set MODEL=/path/to/model.gguf}
 PREFIX=${PREFIX:-qwen3}
+NGL=${NGL:-0}
 
 command -v "$BIN" >/dev/null || [ -x "$BIN" ] || {
     echo "collector binary not found: $BIN"
@@ -27,7 +31,7 @@ for w in chat code story summarize; do
     n=400
     [ "$w" = summarize ] && n=200
     echo "=== workload: $w (n=$n) ==="
-    "$BIN" -m "$MODEL" -f "prompts/$w.txt" -o "traces/$PREFIX-$w.raw.jsonl" -n $n 2>&1 | tail -1
+    "$BIN" -m "$MODEL" -f "prompts/$w.txt" -o "traces/$PREFIX-$w.raw.jsonl" -n $n -ngl "$NGL" 2>&1 | tail -1
 done
 
 cat traces/$PREFIX-chat.raw.jsonl traces/$PREFIX-code.raw.jsonl \

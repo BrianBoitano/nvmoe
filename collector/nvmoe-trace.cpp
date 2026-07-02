@@ -27,9 +27,29 @@ struct trace_state {
     long   records = 0;
 };
 
+// The router's tensor is named exactly "ffn_moe_topk-<layer>". Anything
+// looser double-counts on nvmoe pack models, whose graphs also carry
+// "ffn_moe_topk_nvmoe-<layer>" (cache-slot-remapped ids, not expert ids)
+// and " (cont)"-suffixed copies of the view.
+static bool is_router_topk(const char * name) {
+    if (strncmp(name, "ffn_moe_topk-", 13) != 0) {
+        return false;
+    }
+    const char * p = name + 13;
+    if (*p == '\0') {
+        return false;
+    }
+    for (; *p; p++) {
+        if (*p < '0' || *p > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
 // eval callback: ask-phase selects which tensors to observe, data-phase logs them
 static bool trace_cb(struct ggml_tensor * t, bool ask, void * user_data) {
-    const bool is_topk = strncmp(t->name, "ffn_moe_topk", 12) == 0;
+    const bool is_topk = is_router_topk(t->name);
     if (ask) {
         return is_topk; // request data only for expert-selection tensors
     }
@@ -50,8 +70,15 @@ static bool trace_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     const char * dash = strrchr(t->name, '-');
     const int layer = dash ? atoi(dash + 1) : -1;
 
+    // ffn_moe_topk is a VIEW of the top_k columns of the [n_expert, n_tokens]
+    // argsort tensor — rows are nb[1] apart, NOT contiguous. A flat read
+    // returns token 0's full ranking chunked as fake rows whenever
+    // n_tokens > 1 (prefill); read row by row through the stride instead.
     std::vector<int32_t> ids((size_t) top_k * n_tokens);
-    ggml_backend_tensor_get(t, ids.data(), 0, ids.size() * sizeof(int32_t));
+    for (int tok = 0; tok < n_tokens; tok++) {
+        ggml_backend_tensor_get(t, ids.data() + (size_t) tok * top_k,
+                                (size_t) tok * t->nb[1], top_k * sizeof(int32_t));
+    }
 
     fprintf(state->out, "{\"l\":%d,\"t\":%d,\"e\":[", layer, n_tokens);
     for (int tok = 0; tok < n_tokens; tok++) {
