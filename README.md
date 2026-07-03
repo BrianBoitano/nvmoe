@@ -4,10 +4,16 @@
 
 Modern flagship open-weight models (DeepSeek-R1 671B, Qwen3-Next-80B, GPT-OSS-120B) are Mixture-of-Experts: only a few percent of their parameters activate per token. nvmoe's bet is that this makes VRAM a *cache*, not a *container* — the model's bulk lives on a fast SSD, and the GPU holds only what's hot. No retraining, no new quantization format, no 128GB workstation. A 16GB card, a PCIe 4.0 NVMe, and about 4GB of RAM.
 
+> **Want to just run something?** [docs/MODELS.md](docs/MODELS.md) is the
+> verified-model guide: download links, exact serve configs, measured speeds,
+> and a copy-paste zero-to-chatting walkthrough. Everything on it passed the
+> bit-identical gate on this repo's reference box.
+
 ## Who is this for
 
 - **You have a 8-24GB GPU and want to run models that don't fit.** Measured, not simulated: Qwen3-30B-A3B (18.6GB, doesn't fit a 16GB card) decodes at **166 tok/s** from its NVMe pack — 2.1x the best llama.cpp offload split — using 756MB of host RAM. **GPT-OSS-120B (63GB) decodes at 24.5 tok/s** on the same card, ~3x the best stock configuration this box can attempt, inside a 4GB memory cgroup ([tables](runtime/README.md)).
 - **You want a flagship you'll actually use.** Qwen3-Next-80B-A3B (48.5GB) decodes at **44.8 tok/s** from its pack on the 16GB reference card — measured, warm, with ~1GB of host RAM. The 80-120B ultra-sparse tier is this design's sweet spot: big enough to be a real flagship, sparse enough to cache. (The 671B-class runs too — DeepSeek-R1 pencils out to ~2 tok/s — but flat DeepSeek-family routing makes that a capacity proof, not a daily driver.)
+- **You want long context locally.** The 256k-native Qwen3-30B-2507 serves **131,072 tokens of context** (q8_0 KV) alongside a 6GB expert cache in 14.2GB total — a 128k-context 30B on a 16GB card, at 50-80 tok/s.
 - **Your RAM is spoken for.** Every existing offload system (KTransformers, Fiddler, llama.cpp's `exps=CPU`) parks expert weights in system RAM. If your machine runs a Docker stack, a game, or VMs, that RAM isn't free. nvmoe bypasses the page cache entirely (O_DIRECT) and caps host memory use.
 
 ## The idea in plain English
@@ -220,7 +226,8 @@ tests/          test_repack.py — full repack round-trip on a synthetic tiny
                 MoE GGUF, runs in milliseconds, no model download
 prompts/        the four standard trace workloads (ChatML format)
 traces/         real routing traces (*.tokens.jsonl committed as samples)
-docs/           DESIGN.md (architecture), PACK_FORMAT.md (expert pack spec),
+docs/           MODELS.md (verified models + zero-to-chat walkthrough),
+                DESIGN.md (architecture), PACK_FORMAT.md (expert pack spec),
                 INTEGRATION.md (llama.cpp hook points),
                 TRACE_COLLECTION.md (how tracing works)
 ```
