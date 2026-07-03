@@ -7,14 +7,15 @@ Modern flagship open-weight models (DeepSeek-R1 671B, Qwen3-Next-80B, GPT-OSS-12
 > **Want to just run something?**
 > ```bash
 > git clone https://github.com/BrianBoitano/nvmoe && cd nvmoe
-> ./nvmoe doctor          # is this machine ready? (points at prebuilt binaries if not)
+> # grab a prebuilt runtime tarball into ./bin — 2 minutes, no compiler:
+> #   docs/INSTALL.md, Path A
+> ./nvmoe doctor               # confirms the machine is ready
 > ./nvmoe run qwen3-30b-2507   # download -> repack -> byte-verify -> serve on :8901/v1
 > ```
-> `./nvmoe list` shows every verified model with measured speeds;
-> [docs/MODELS.md](docs/MODELS.md) has the receipts, the rejected-models list,
-> and the manual walkthrough behind the CLI. Prebuilt Linux binaries of the
-> patched llama.cpp ship on [Releases](https://github.com/BrianBoitano/nvmoe/releases)
-> — unpack as `./bin` and skip the compile entirely.
+> Full install (prebuilt binaries — no compiler — or from source):
+> **[docs/INSTALL.md](docs/INSTALL.md)**. Verified models + measured speeds:
+> `./nvmoe list` or **[docs/MODELS.md](docs/MODELS.md)**, which also covers
+> testing models that aren't on the list yet.
 
 ## Who is this for
 
@@ -234,7 +235,8 @@ tests/          test_repack.py — full repack round-trip on a synthetic tiny
                 MoE GGUF, runs in milliseconds, no model download
 prompts/        the four standard trace workloads (ChatML format)
 traces/         real routing traces (*.tokens.jsonl committed as samples)
-docs/           MODELS.md (verified models + zero-to-chat walkthrough),
+docs/           INSTALL.md (three install paths + troubleshooting),
+                MODELS.md (verified models, zero-to-chat, test-your-own guide),
                 DESIGN.md (architecture), PACK_FORMAT.md (expert pack spec),
                 INTEGRATION.md (llama.cpp hook points),
                 TRACE_COLLECTION.md (how tracing works)

@@ -62,6 +62,14 @@ CATALOG = {
         "ctx": 65536, "extra": [], "kv_q8": False,
         "measured": "44.8 tok/s warm @11.5GB cache; 1GB host RAM",
     },
+    "qwen3-30b": {
+        "label": "Qwen3-30B-A3B (original) — maximum speed, 32k ctx",
+        "url": "https://huggingface.co/unsloth/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf",
+        "file": "qwen3-30b-a3b-q4_k_m.gguf",
+        "size": 18556686912,
+        "ctx": 32768, "extra": [], "kv_q8": False,
+        "measured": "166 tok/s warm @12GB cache — the speed champion; 2507 supersedes it for context",
+    },
     "gpt-oss-120b": {
         "label": "GPT-OSS-120B (native MXFP4) — deep single-shot reasoning",
         "url": None,  # 3 splits; see docs/MODELS.md (merge with llama-gguf-split)
@@ -140,12 +148,10 @@ def doctor(args) -> int:
         say("runtime", f"llama-server found: {bins}")
     else:
         ok = False
-        say("runtime", "no built llama-server. Build it:", C_ERR)
-        print("         ./runtime/apply.sh")
-        print("         cmake -B llama.cpp-nvmoe/build-cuda -S llama.cpp-nvmoe \\")
-        print("               -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native -DLLAMA_BUILD_SERVER=ON")
-        print("         cmake --build llama.cpp-nvmoe/build-cuda -j --target llama-server llama-nvmoe-logits")
-        print("         (or download a prebuilt release: github.com/BrianBoitano/nvmoe/releases)")
+        say("runtime", "no runnable llama-server found.", C_ERR)
+        print("         Fastest fix: download a prebuilt release and unpack it as ./bin")
+        print("           https://github.com/BrianBoitano/nvmoe/releases")
+        print("         All install paths + troubleshooting: docs/INSTALL.md")
 
     models = ROOT / "models"
     free = shutil.disk_usage(models if models.exists() else ROOT).free

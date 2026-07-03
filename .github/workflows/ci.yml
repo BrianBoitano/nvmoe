@@ -28,8 +28,6 @@ jobs:
 
       - name: add the trace collector example
         run: |
-          cp collector/nvmoe-trace.cpp collector/CMakeLists.txt \
-             llama.cpp-nvmoe/examples/ 2>/dev/null || true
           mkdir -p llama.cpp-nvmoe/examples/nvmoe-trace
           cp collector/nvmoe-trace.cpp collector/CMakeLists.txt llama.cpp-nvmoe/examples/nvmoe-trace/
           grep -q nvmoe-trace llama.cpp-nvmoe/examples/CMakeLists.txt || \
