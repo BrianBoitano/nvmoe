@@ -68,16 +68,19 @@ PRED_RANGE = (0.7, 2.5)     # measured/predicted spread over the 11 anchors
 # stats, most- to least-cacheable:
 #   gptoss   top-10% experts carry 56.7% of traffic, token overlap 50.4%
 #   qwen3    34.7% / 43.4%
+#   glm      26.7% / 37.0%   (GLM-4.5-Air — between qwen3 and deepseek)
 #   deepseek 17.7% / 24.2%   (fine-grained routing is flat — R1's family)
 FAMILIES = {
     "qwen3":    "qwen3-all.tokens.jsonl",
     "gptoss":   "gptoss-all.tokens.jsonl",
+    "glm":      "glm-all.tokens.jsonl",
     "deepseek": "dsv2lite-all.tokens.jsonl",
 }
 ARCH_FAMILY = {
     "qwen3moe": "qwen3", "qwen2moe": "qwen3", "olmoe": "qwen3",
     "qwen3next": "qwen3",
     "gpt-oss": "gptoss",
+    "glm4moe": "glm",
     "deepseek2": "deepseek", "deepseek3": "deepseek",
     # sim/presets.py keys, for --preset plans of models not on disk
     "qwen3-30b-a3b": "qwen3", "qwen3-next-80b": "qwen3", "olmoe-7b": "qwen3",
@@ -374,6 +377,12 @@ POSTDICT = [
      Geometry("qwen3-next-80b-a3b-instruct-q4_k_m.gguf", "qwen3next", 48, 512, 10,
               [(1769472, 24), (2039808, 24)], int(1.70e9), 0.4),
      [(11776, 35.4), (8192, 27.3), (4096, 18.0)]),
+    # A12B cautionary tale: 4.2GB of expert reads per token; the planner
+    # said 2.4 before the bench said 2.80 — active params are the wall
+    ("glm-4.5-air-q4_k_m", "glm",
+     Geometry("glm-4.5-air-q4_k_m.gguf", "glm4moe", 45, 128, 8,
+              [(11460608, 45)], int(5.0e9), 0.8),
+     [(7936, 2.80), (4096, 2.29)]),
     ("deepseek-v2-lite-chat-q4_k_m", "deepseek",
      Geometry("deepseek-v2-lite-chat-q4_k_m.gguf", "deepseek2", 26, 64, 6,
               [(5226496, 14), (6307840, 12)], int(0.84e9), 0.5),

@@ -117,6 +117,7 @@ CUDA 12.8, `-ngl` as shown; "prefetch" = lookahead prefetch active):
 | CUDA `-ngl 8` | OLMoE-1B-7B Q4_0 | 32 | pools split CPU + VRAM (+ prefetch) | BIT-IDENTICAL |
 | CPU | Qwen3-Next-80B Q4_K_M | 16 | 8GB + prefetch (hybrid attention, shared expert) | BIT-IDENTICAL |
 | CUDA `-ngl 14` | Qwen3-Next-80B Q4_K_M | 16 | 8GB, pools split CPU + VRAM | BIT-IDENTICAL |
+| CPU | GLM-4.5-Air Q4_K_M | 12 | 8GB (sigmoid+bias gating, shared expert, NextN skip) | BIT-IDENTICAL |
 
 Prefetch cannot change the math — it only warms cache slots; the ids the
 matmuls consume always come from the real router — but the eviction /
@@ -269,6 +270,30 @@ NVMOE_CACHE_MB=11776 ./build-cuda/bin/llama-bench \
     -m models/qwen3-next-80b-a3b-instruct-q4_k_m.nvmoe/resident.gguf \
     -ngl 99 -p 512 -n 128 -r 5 -t 8
 ```
+
+## GLM-4.5-Air — the honest negative: active params are the wall
+
+The fourth architecture (46 MoE layers × 128 experts top-8, sigmoid gating
+with selection bias, shared expert, a NextN/MTP layer whose experts are
+packed but never referenced) passes the gate — **bit-identical on CPU,
+12 steps** — and then proves the planner right about why it should not be
+run this way: A12B means ~4.2GB of expert reads per token (2.2x
+GPT-OSS-120B's), and 5GB of resident weights squeeze the cache to ~13% of
+experts on a 16GB card.
+
+| config | tg64 |
+|---|---|
+| nvmoe pack, 7.9GB cache (max) | 2.80 ± 0.08 |
+| nvmoe pack, 4GB | 2.29 ± 0.04 |
+| stock, best partial offload (`-ngl 8`) | 2.14 ± 0.50 |
+
+The planner predicted 2.4 tok/s at the max cache from the freshly collected
+trace before the bench measured 2.80 (1.15x) — its fourth routing family
+(`traces/glm-all.tokens.jsonl`: top-10% experts carry 26.7% of traffic,
+between Qwen3's 34.7% and V2-Lite's 17.7%). The design lesson, now measured
+at both ends: **usable-from-NVMe on a 16GB card means A3B-class active
+parameters.** Qwen3-Next-80B (A3B) runs at 44.8; GLM-4.5-Air (A12B) runs
+at 2.8. Total size barely matters; active size is destiny.
 
 ## DeepSeek-V2-Lite — third architecture, and what paging costs when you don't need it
 
