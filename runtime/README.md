@@ -118,6 +118,7 @@ CUDA 12.8, `-ngl` as shown; "prefetch" = lookahead prefetch active):
 | CPU | Qwen3-Next-80B Q4_K_M | 16 | 8GB + prefetch (hybrid attention, shared expert) | BIT-IDENTICAL |
 | CUDA `-ngl 14` | Qwen3-Next-80B Q4_K_M | 16 | 8GB, pools split CPU + VRAM | BIT-IDENTICAL |
 | CPU | GLM-4.5-Air Q4_K_M | 12 | 8GB (sigmoid+bias gating, shared expert, NextN skip) | BIT-IDENTICAL |
+| CPU | Qwen3-30B-2507 + Coder-30B Q4_K_M | 16 | 4GB + prefetch | BIT-IDENTICAL |
 
 Prefetch cannot change the math — it only warms cache slots; the ids the
 matmuls consume always come from the real router — but the eviction /
@@ -269,6 +270,21 @@ python3 tools/verify_pack.py models/qwen3-next-80b-a3b-instruct-q4_k_m.nvmoe \
 NVMOE_CACHE_MB=11776 ./build-cuda/bin/llama-bench \
     -m models/qwen3-next-80b-a3b-instruct-q4_k_m.nvmoe/resident.gguf \
     -ngl 99 -p 512 -n 128 -r 5 -t 8
+```
+
+## Qwen3-30B-2507 + Qwen3-Coder-30B — the long-context workhorses
+
+The 256k-native July-2025 refreshes of the 30B (identical geometry to the
+original: 48 × 128 top-8, 2.9MB extents) both gate **bit-identical** on
+CPU with lookahead prefetch folding at 87% accuracy — the sixth and
+seventh models in the predictor's 84-87% band. The 2507 Instruct decodes
+at **80.5 ± 8.6 tok/s** warm at a 9GB cache (pp512 227). The serving
+configuration that matters: **131,072 tokens of context with q8_0 KV
+quantization fits in 14.2GB** alongside a 6GB expert cache — a 128k-context
+30B-class model on a 16GB card.
+
+```bash
+NVMOE_CACHE_MB=6144 ./build-cuda/bin/llama-server     -m models/qwen3-30b-a3b-instruct-2507-q4_k_m.nvmoe/resident.gguf     -ngl 99 -c 131072 -ctk q8_0 -ctv q8_0 -fa 1 --host 0.0.0.0 --port 8901
 ```
 
 ## GLM-4.5-Air — the honest negative: active params are the wall

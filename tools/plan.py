@@ -377,6 +377,12 @@ POSTDICT = [
      Geometry("qwen3-next-80b-a3b-instruct-q4_k_m.gguf", "qwen3next", 48, 512, 10,
               [(1769472, 24), (2039808, 24)], int(1.70e9), 0.4),
      [(11776, 35.4), (8192, 27.3), (4096, 18.0)]),
+    # the 2507 refresh of the 30B, served long-context (row = tg128 @9216
+    # warm, the pre-serving bench; the serving config is 128k ctx + q8 KV)
+    ("qwen3-30b-2507-q4_k_m", "qwen3",
+     Geometry("qwen3-30b-a3b-instruct-2507-q4_k_m.gguf", "qwen3moe", 48, 128, 8,
+              [(2654208, 24), (3059712, 24)], int(0.95e9), 1.0),
+     [(9216, 80.5)]),
     # A12B cautionary tale: 4.2GB of expert reads per token; the planner
     # said 2.4 before the bench said 2.80 — active params are the wall
     ("glm-4.5-air-q4_k_m", "glm",
