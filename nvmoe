@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""nvmoe — run flagship MoE models from your NVMe on a small GPU.
+
+    ./nvmoe doctor                     is this machine ready?
+    ./nvmoe list                       verified models + what's local
+    ./nvmoe run qwen3-30b-2507         download -> repack -> verify -> serve
+    ./nvmoe run qwen3-30b-2507 --port 8901 --ctx 32768
+    ./nvmoe plan qwen3-30b-2507        what to expect on this hardware
+    ./nvmoe stop                       stop the server this tool started
+
+`run` is idempotent: every stage is skipped if its output already exists
+(the download resumes if interrupted). The server it starts is plain
+`llama-server` — an OpenAI-compatible endpoint; point any chat UI at
+http://localhost:<port>/v1. Python 3.10+ stdlib only, like the rest of
+the repo.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "tools"))
+sys.path.insert(0, str(ROOT / "sim"))
+
+MIB = 1 << 20
+PIDFILE = ROOT / ".nvmoe-server.json"
+
+# Verified catalog — every entry passed the bit-identical gate and was
+# benchmarked (docs/MODELS.md has the receipts). "extra" are llama-server
+# flags the measured config used; "kv_q8" halves the KV estimate.
+CATALOG = {
+    "qwen3-30b-2507": {
+        "label": "Qwen3-30B-A3B-Instruct-2507 — 256k-native long-context workhorse",
+        "url": "https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF/resolve/main/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
+        "file": "qwen3-30b-a3b-instruct-2507-q4_k_m.gguf",
+        "size": 18556686752,
+        "ctx": 131072, "extra": ["-ctk", "q8_0", "-ctv", "q8_0", "-fa", "1"], "kv_q8": True,
+        "measured": "80.5 tok/s warm @9GB cache; 128k ctx fits 14.2GB total",
+    },
+    "qwen3-coder-30b": {
+        "label": "Qwen3-Coder-30B-A3B-Instruct — 256k-native coding agent",
+        "url": "https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/resolve/main/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
+        "file": "qwen3-coder-30b-a3b-instruct-q4_k_m.gguf",
+        "size": 18556689568,
+        "ctx": 131072, "extra": ["-ctk", "q8_0", "-ctv", "q8_0", "-fa", "1"], "kv_q8": True,
+        "measured": "same geometry/speed class as 2507",
+    },
+    "qwen3-next-80b": {
+        "label": "Qwen3-Next-80B-A3B-Instruct — the flagship pick",
+        "url": "https://huggingface.co/unsloth/Qwen3-Next-80B-A3B-Instruct-GGUF/resolve/main/Qwen3-Next-80B-A3B-Instruct-Q4_K_M.gguf",
+        "file": "qwen3-next-80b-a3b-instruct-q4_k_m.gguf",
+        "size": 48506100512,
+        "ctx": 65536, "extra": [], "kv_q8": False,
+        "measured": "44.8 tok/s warm @11.5GB cache; 1GB host RAM",
+    },
+    "gpt-oss-120b": {
+        "label": "GPT-OSS-120B (native MXFP4) — deep single-shot reasoning",
+        "url": None,  # 3 splits; see docs/MODELS.md (merge with llama-gguf-split)
+        "file": "gpt-oss-120b-mxfp4.gguf",
+        "size": None,
+        "ctx": 8192, "extra": [], "kv_q8": False,
+        "measured": "24.5 tok/s @11GB cache",
+    },
+    "olmoe-1b-7b": {
+        "label": "OLMoE-1B-7B — tiny pipeline test model",
+        "url": "https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct-GGUF/resolve/main/olmoe-1b-7b-0924-instruct-q4_0.gguf",
+        "file": "olmoe-q4_0.gguf",
+        "size": None,
+        "ctx": 4096, "extra": [], "kv_q8": False,
+        "measured": "pipeline smoke test; fits in VRAM (stock is faster)",
+    },
+}
+
+C_OK, C_WARN, C_ERR, C_END = "\033[32m", "\033[33m", "\033[31m", "\033[0m"
+
+
+def say(tag, msg, color=C_OK):
+    print(f"{color}[{tag}]{C_END} {msg}")
+
+
+# ------------------------------------------------------------------ probes ---
+
+def find_server_bin() -> Path | None:
+    env = os.environ.get("NVMOE_BIN_DIR")
+    candidates = [Path(env)] if env else []
+    # apply.sh clones the fork into the repo; also accept a sibling checkout
+    # and a prebuilt-release bin/ dropped at the repo root. Prefer the CUDA
+    # build only when a GPU is actually visible — a CUDA binary on a
+    # driverless box dies at startup.
+    builds = ("build-cuda", "build") if gpu_vram_mb() else ("build", "build-cuda")
+    for base in (ROOT / "llama.cpp-nvmoe", ROOT.parent / "llama.cpp-nvmoe"):
+        candidates += [base / b / "bin" for b in builds]
+    candidates += [ROOT / "bin"]
+    for d in candidates:
+        srv = d / "llama-server" if d else None
+        if not (srv and srv.exists()):
+            continue
+        try:  # does it actually run on this machine?
+            subprocess.run([str(srv), "--version"], capture_output=True, timeout=15)
+            return d
+        except Exception:
+            continue
+    return None
+
+
+def gpu_vram_mb() -> int | None:
+    smi = shutil.which("nvidia-smi")
+    if not smi:
+        return None
+    try:
+        out = subprocess.run([smi, "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=8).stdout.strip()
+        return int(out.splitlines()[0])
+    except Exception:
+        return None
+
+
+def doctor(args) -> int:
+    ok = True
+    v = sys.version_info
+    say("python", f"{v.major}.{v.minor}", C_OK if v >= (3, 10) else C_ERR)
+
+    vram = gpu_vram_mb()
+    if vram:
+        say("gpu", f"{vram} MiB VRAM (nvidia-smi)")
+    else:
+        say("gpu", "nvidia-smi not found — CPU-only (slow; fine for testing)", C_WARN)
+
+    bins = find_server_bin()
+    if bins:
+        say("runtime", f"llama-server found: {bins}")
+    else:
+        ok = False
+        say("runtime", "no built llama-server. Build it:", C_ERR)
+        print("         ./runtime/apply.sh")
+        print("         cmake -B llama.cpp-nvmoe/build-cuda -S llama.cpp-nvmoe \\")
+        print("               -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native -DLLAMA_BUILD_SERVER=ON")
+        print("         cmake --build llama.cpp-nvmoe/build-cuda -j --target llama-server llama-nvmoe-logits")
+        print("         (or download a prebuilt release: github.com/BrianBoitano/nvmoe/releases)")
+
+    models = ROOT / "models"
+    free = shutil.disk_usage(models if models.exists() else ROOT).free
+    say("disk", f"{free / 1e9:.0f}GB free at {models}",
+        C_OK if free > 25e9 else C_WARN)
+    say("ssd", "measure honestly: python3 tools/nvme_probe.py <big file on that disk>", C_WARN)
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------- download ---
+
+def download(url: str, dest: Path, size: int | None, chunks: int = 6) -> None:
+    """Parallel byte-range download, resume-friendly (HF throttles single
+    streams to a few MB/s). Part files live next to dest until assembly."""
+    if dest.exists() and (size is None or dest.stat().st_size == size):
+        say("download", f"{dest.name} already complete")
+        return
+    if size is None:
+        req = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=30) as r:
+            size = int(r.headers["Content-Length"])
+    say("download", f"{dest.name} ({size / 1e9:.1f}GB, {chunks} streams) — resumable, ctrl-c safe")
+
+    step = (size + chunks - 1) // chunks
+    parts = [(dest.with_suffix(dest.suffix + f".part{i}"), i * step, min((i + 1) * step, size) - 1)
+             for i in range(chunks)]
+    done = [p.stat().st_size if p.exists() else 0 for p, _, _ in parts]
+    errors: list[str] = []
+
+    def fetch(idx: int):
+        path, start, end = parts[idx]
+        want = end - start + 1
+        while done[idx] < want:
+            try:
+                req = urllib.request.Request(url, headers={"Range": f"bytes={start + done[idx]}-{end}"})
+                with urllib.request.urlopen(req, timeout=60) as r, open(path, "ab") as f:
+                    while True:
+                        buf = r.read(1 << 20)
+                        if not buf:
+                            break
+                        f.write(buf)
+                        done[idx] += len(buf)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                if done[idx] < want:
+                    time.sleep(10)  # transient; resume from byte offset
+                    errors.append(str(e))
+                    if len(errors) > 200:
+                        return
+
+    threads = [threading.Thread(target=fetch, args=(i,), daemon=True) for i in range(chunks)]
+    for t in threads:
+        t.start()
+    total_start = time.time()
+    while any(t.is_alive() for t in threads):
+        time.sleep(5)
+        got = sum(done)
+        rate = got / max(time.time() - total_start, 1) / 1e6
+        pct = 100 * got / size
+        eta = (size - got) / max(rate * 1e6, 1)
+        print(f"\r  {pct:5.1f}%  {got / 1e9:6.2f}/{size / 1e9:.2f}GB  {rate:5.1f}MB/s  eta {eta / 60:4.0f}m ",
+              end="", flush=True)
+    print()
+    if sum(done) < size:
+        raise SystemExit(f"download incomplete ({sum(done)}/{size}); rerun to resume")
+    with open(dest.with_suffix(dest.suffix + ".tmp"), "wb") as out:
+        for path, _, _ in parts:
+            with open(path, "rb") as f:
+                shutil.copyfileobj(f, out, 16 << 20)
+    got = dest.with_suffix(dest.suffix + ".tmp").stat().st_size
+    if got != size:
+        raise SystemExit(f"assembled size mismatch ({got} != {size}); parts kept — rerun")
+    dest.with_suffix(dest.suffix + ".tmp").rename(dest)
+    for path, _, _ in parts:
+        path.unlink(missing_ok=True)
+    say("download", f"{dest.name} complete + size-verified")
+
+
+# -------------------------------------------------------------------- run ---
+
+def ensure_pack(gguf: Path) -> Path:
+    import repack_gguf  # noqa: F401  (imported for its side-effect-free helpers)
+    pack = gguf.parent / (gguf.stem + ".nvmoe")
+    if (pack / "manifest.json").exists():
+        say("repack", f"{pack.name} already exists")
+        return pack
+    say("repack", f"{gguf.name} -> expert pack (one-time, ~1-4 min)")
+    for tool, extra in (("repack_gguf.py", []), ("verify_pack.py", [str(pack)])):
+        cmd = [sys.executable, str(ROOT / "tools" / tool)] + (extra + [str(gguf)] if extra else [str(gguf)])
+        r = subprocess.run(cmd)
+        if r.returncode != 0:
+            raise SystemExit(f"{tool} failed")
+    say("verify", "pack is byte-identical to the source")
+    return pack
+
+
+def serve_config(m: dict, gguf: Path, ctx: int):
+    """Cache budget for THIS machine: VRAM - resident - KV - headroom."""
+    import plan as planner
+    geo = planner.geometry_from_gguf(gguf)
+    vram_mb = gpu_vram_mb()
+    if vram_mb is None:
+        return None, geo  # CPU: default all-resident behavior, let RAM decide
+    kv_gb = planner.estimate_kv_gb(planner.read_gguf(gguf), geo.arch, n_ctx=ctx)
+    if m.get("kv_q8"):
+        kv_gb /= 2
+    budget = vram_mb * MIB - geo.resident_bytes - kv_gb * 1e9 - 1.5e9
+    cache_mb = max(int(budget / MIB) // 256 * 256, 512)
+    return cache_mb, geo
+
+
+def run(args) -> int:
+    m = CATALOG.get(args.model)
+    if not m:
+        say("run", f"unknown model {args.model!r} — ./nvmoe list", C_ERR)
+        return 2
+    if m["url"] is None:
+        say("run", f"{args.model} ships as HF splits — follow docs/MODELS.md "
+                   f"(download 3 parts, llama-gguf-split --merge), then rerun", C_ERR)
+        return 2
+    bins = find_server_bin()
+    if not bins:
+        doctor(args)
+        return 1
+
+    models = ROOT / "models"
+    models.mkdir(exist_ok=True)
+    gguf = models / m["file"]
+    download(m["url"], gguf, m["size"])
+    pack = ensure_pack(gguf)
+
+    ctx = args.ctx or m["ctx"]
+    cache_mb, geo = serve_config(m, gguf, ctx)
+    if cache_mb is not None and cache_mb < geo.cliff_frac * geo.paged_bytes / MIB:
+        say("plan", f"cache {cache_mb}MB is below this model's thrash cliff — expect a crawl", C_WARN)
+
+    alias = args.model + "-nvmoe"
+    env = dict(os.environ)
+    if cache_mb is not None:
+        env["NVMOE_CACHE_MB"] = str(cache_mb)
+        say("plan", f"expert cache {cache_mb}MB, ctx {ctx} "
+                    f"(reference numbers: {m['measured']})")
+    ngl = ["-ngl", "99"] if gpu_vram_mb() else []
+    cmd = [str(bins / "llama-server"), "-m", str(pack / "resident.gguf"),
+           *ngl, "-c", str(ctx), "-t", str(os.cpu_count() or 8), *m["extra"],
+           "--host", args.host, "--port", str(args.port), "--alias", alias]
+    say("serve", " ".join(cmd))
+    proc = subprocess.Popen(cmd, env=env)
+    PIDFILE.write_text(json.dumps({"pid": proc.pid, "alias": alias, "port": args.port}))
+
+    url = f"http://{'localhost' if args.host == '0.0.0.0' else args.host}:{args.port}"
+    for _ in range(60):
+        if proc.poll() is not None:
+            say("serve", "llama-server exited during startup — see its log above", C_ERR)
+            return 1
+        try:
+            with urllib.request.urlopen(url + "/health", timeout=3):
+                break
+        except Exception:
+            time.sleep(5)
+    say("ready", f"{alias} serving at {url}/v1  (OpenAI-compatible; ctrl-c or ./nvmoe stop)")
+    try:
+        proc.wait()
+    except KeyboardInterrupt:
+        proc.terminate()
+    return 0
+
+
+def stop(args) -> int:
+    if not PIDFILE.exists():
+        say("stop", "no server started by this tool", C_WARN)
+        return 0
+    info = json.loads(PIDFILE.read_text())
+    try:
+        os.kill(info["pid"], signal.SIGTERM)
+        say("stop", f"stopped {info['alias']} (pid {info['pid']})")
+    except ProcessLookupError:
+        say("stop", "already gone", C_WARN)
+    PIDFILE.unlink()
+    return 0
+
+
+def list_models(args) -> int:
+    models = ROOT / "models"
+    print(f"{'id':<18} {'local':<12} description")
+    print("-" * 100)
+    for mid, m in CATALOG.items():
+        gguf = models / m["file"]
+        pack = models / (Path(m["file"]).stem + ".nvmoe" ) / "manifest.json"
+        state = "pack ready" if pack.exists() else ("gguf only" if gguf.exists() else "—")
+        print(f"{mid:<18} {state:<12} {m['label']}")
+        print(f"{'':<18} {'':<12}   {m['measured']}")
+    print("\nreceipts + rejected models: docs/MODELS.md   |   any other GGUF: python3 tools/plan.py <file>")
+    return 0
+
+
+def plan_cmd(args) -> int:
+    m = CATALOG.get(args.model)
+    target = (ROOT / "models" / m["file"]) if m else Path(args.model)
+    if not target.exists():
+        say("plan", f"{target} not downloaded — showing the catalog reference instead", C_WARN)
+        if m:
+            print(f"  {m['label']}\n  measured: {m['measured']}\n  serve: ctx {m['ctx']} {' '.join(m['extra'])}")
+            return 0
+        return 2
+    return subprocess.run([sys.executable, str(ROOT / "tools" / "plan.py"), str(target)]).returncode
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("doctor", help="is this machine ready?").set_defaults(fn=doctor)
+    sub.add_parser("list", help="verified models + local state").set_defaults(fn=list_models)
+    p = sub.add_parser("plan", help="expected speed on this hardware")
+    p.add_argument("model")
+    p.set_defaults(fn=plan_cmd)
+    r = sub.add_parser("run", help="download -> repack -> verify -> serve")
+    r.add_argument("model")
+    r.add_argument("--port", type=int, default=8901)
+    r.add_argument("--host", default="0.0.0.0")
+    r.add_argument("--ctx", type=int, help="override the reference context length")
+    r.set_defaults(fn=run)
+    sub.add_parser("stop", help="stop the server this tool started").set_defaults(fn=stop)
+    args = ap.parse_args()
+    sys.exit(args.fn(args))
+
+
+if __name__ == "__main__":
+    main()

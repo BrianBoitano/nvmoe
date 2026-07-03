@@ -4,10 +4,17 @@
 
 Modern flagship open-weight models (DeepSeek-R1 671B, Qwen3-Next-80B, GPT-OSS-120B) are Mixture-of-Experts: only a few percent of their parameters activate per token. nvmoe's bet is that this makes VRAM a *cache*, not a *container* — the model's bulk lives on a fast SSD, and the GPU holds only what's hot. No retraining, no new quantization format, no 128GB workstation. A 16GB card, a PCIe 4.0 NVMe, and about 4GB of RAM.
 
-> **Want to just run something?** [docs/MODELS.md](docs/MODELS.md) is the
-> verified-model guide: download links, exact serve configs, measured speeds,
-> and a copy-paste zero-to-chatting walkthrough. Everything on it passed the
-> bit-identical gate on this repo's reference box.
+> **Want to just run something?**
+> ```bash
+> git clone https://github.com/BrianBoitano/nvmoe && cd nvmoe
+> ./nvmoe doctor          # is this machine ready? (points at prebuilt binaries if not)
+> ./nvmoe run qwen3-30b-2507   # download -> repack -> byte-verify -> serve on :8901/v1
+> ```
+> `./nvmoe list` shows every verified model with measured speeds;
+> [docs/MODELS.md](docs/MODELS.md) has the receipts, the rejected-models list,
+> and the manual walkthrough behind the CLI. Prebuilt Linux binaries of the
+> patched llama.cpp ship on [Releases](https://github.com/BrianBoitano/nvmoe/releases)
+> — unpack as `./bin` and skip the compile entirely.
 
 ## Who is this for
 
@@ -201,6 +208,7 @@ Prefill is the known weak spot: a long prompt touches nearly every expert (~18s 
   - [x] **2.4b GPT-OSS-120B** ([tables + commands](runtime/README.md)): a 63GB model on the 16GB card — **24.5 tok/s decode at an 11GB cache, ~3x the best stock attempt, inside a 4GB cgroup**; the sweep (10.5/18.7/24.5 at 4/8/11GB) tracks the hit-rate curves, and its 12.6MB extents produced the extent-size speculation gate (wasted prefetch guesses cost more than they hide on fetch-bound decode)
 - [x] **Phase 3 — planner** (`tools/plan.py`): reads any MoE GGUF's geometry, takes your VRAM/SSD numbers, and emits the placement plan — cache budget, prefetch setting, expected decode range, and the exact repack/verify/gate/bench commands. Validated by postdiction: `--postdict` reprints its predictions against all eleven measured configurations (0.7-2.5x, with the systematic direction explained there)
 - [x] **The usable-flagship tier — Qwen3-Next-80B-A3B** ([tables + commands](runtime/README.md)): the planner's pick, measured same-day — **44.8 tok/s warm decode at an 11.5GB cache, 2.0x the best stock offload, at full speed inside a 4GB cgroup with a 1.01GB peak**; first hybrid-attention architecture through the pack (bit-identical CPU and split-offload GPU), and the first model where lookahead prefetch pays at every budget (+12-17%)
+- [x] **Phase 4 — ship it**: the `nvmoe` CLI (`doctor` / `list` / `run` / `plan` / `stop` — download, repack, byte-verify, plan, and serve a verified model with one command), CI that tests every push and proves the patch series still applies, and prebuilt Linux binaries (CPU + fat CUDA) on tagged releases
 - [x] **GLM-4.5-Air 106B-A12B — measured, and honestly rejected** ([numbers](runtime/README.md)): fourth architecture through the pack (bit-identical), fourth routing family traced and committed, and the planner's prediction landed within 15% of the bench — at 2.8 tok/s. A12B active params need 4.2GB of expert reads per token; the measured law of the 16GB card is **A3B-class active parameters or bust**. Total size barely matters; active size is destiny
 
 *(A DeepSeek-R1-671B run was on the roadmap as a capacity stunt. The planner's own postdiction killed it: flat DeepSeek-family routing + a cache budget pinned at its 3.1% thrash cliff pencils out to 1-3 tok/s at visible 1.58-bit quality loss — it would prove VRAM isn't the wall, but nobody would use it. The 16GB card's real win is the tier below, where decode is faster than reading speed.)*

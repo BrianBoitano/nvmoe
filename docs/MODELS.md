@@ -31,6 +31,16 @@ you exactly this).
 | Mixtral-class coarse MoE | 99MB experts cache terribly (simulated; the geometry argument is in the README) |
 | Any dense model | physics: every weight streams every token (~0.04 tok/s) |
 
+## The short way: the CLI
+
+```bash
+./nvmoe run qwen3-30b-2507     # does every step below, resumable, idempotent
+```
+
+`./nvmoe doctor` first if you're not sure the machine is ready. The manual
+path below is what the CLI automates — useful when you want to see or
+change any stage.
+
 ## Zero to chatting, copy-paste (Linux + NVIDIA)
 
 Prereqs: git, cmake, CUDA toolkit (or run the build inside an

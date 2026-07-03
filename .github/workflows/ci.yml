@@ -1,0 +1,133 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  # Every push: the stdlib test suite + prove the patch series still applies
+  # to the pinned base and the CPU build compiles.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: unit tests (no model downloads)
+        run: |
+          python3 tests/test_repack.py
+          python3 tests/test_plan.py
+
+      - name: apply patch series to the pinned llama.cpp base
+        run: |
+          git config --global user.name ci
+          git config --global user.email ci@nvmoe
+          ./runtime/apply.sh
+
+      - name: add the trace collector example
+        run: |
+          cp collector/nvmoe-trace.cpp collector/CMakeLists.txt \
+             llama.cpp-nvmoe/examples/ 2>/dev/null || true
+          mkdir -p llama.cpp-nvmoe/examples/nvmoe-trace
+          cp collector/nvmoe-trace.cpp collector/CMakeLists.txt llama.cpp-nvmoe/examples/nvmoe-trace/
+          grep -q nvmoe-trace llama.cpp-nvmoe/examples/CMakeLists.txt || \
+            sed -i 's/    add_subdirectory(simple)/    add_subdirectory(simple)\n    add_subdirectory(nvmoe-trace)/' \
+              llama.cpp-nvmoe/examples/CMakeLists.txt
+
+      - name: CPU build (portable, static)
+        run: |
+          cmake -B llama.cpp-nvmoe/build -S llama.cpp-nvmoe \
+                -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+                -DGGML_NATIVE=OFF -DLLAMA_BUILD_SERVER=ON -DLLAMA_CURL=OFF
+          cmake --build llama.cpp-nvmoe/build -j"$(nproc)" \
+                --target llama-server llama-bench llama-gguf-split \
+                         llama-nvmoe-logits llama-nvmoe-trace
+
+      - name: upload CPU binaries (release assets on tags)
+        uses: actions/upload-artifact@v4
+        with:
+          name: nvmoe-bin-linux-x86_64-cpu
+          path: |
+            llama.cpp-nvmoe/build/bin/llama-server
+            llama.cpp-nvmoe/build/bin/llama-bench
+            llama.cpp-nvmoe/build/bin/llama-gguf-split
+            llama.cpp-nvmoe/build/bin/llama-nvmoe-logits
+            llama.cpp-nvmoe/build/bin/llama-nvmoe-trace
+
+  # Tags only: the CUDA build (compiles without a GPU; users need only the
+  # NVIDIA driver at runtime — cudart is linked statically). Fat binary for
+  # Ampere / Ada / Hopper / Blackwell.
+  release-cuda:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android || true
+          df -h /
+
+      - name: install CUDA toolkit 12.8
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -q
+          sudo apt-get install -y -q cuda-toolkit-12-8
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+
+      - name: apply patch series + trace collector
+        run: |
+          git config --global user.name ci
+          git config --global user.email ci@nvmoe
+          ./runtime/apply.sh
+          mkdir -p llama.cpp-nvmoe/examples/nvmoe-trace
+          cp collector/nvmoe-trace.cpp collector/CMakeLists.txt llama.cpp-nvmoe/examples/nvmoe-trace/
+          grep -q nvmoe-trace llama.cpp-nvmoe/examples/CMakeLists.txt || \
+            sed -i 's/    add_subdirectory(simple)/    add_subdirectory(simple)\n    add_subdirectory(nvmoe-trace)/' \
+              llama.cpp-nvmoe/examples/CMakeLists.txt
+
+      - name: CUDA build (sm_80/86/89/90/120, static cudart)
+        run: |
+          cmake -B llama.cpp-nvmoe/build-cuda -S llama.cpp-nvmoe \
+                -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+                -DGGML_NATIVE=OFF -DGGML_CUDA=ON \
+                -DCMAKE_CUDA_ARCHITECTURES="80;86;89;90;120" \
+                -DCMAKE_CUDA_RUNTIME_LIBRARY=Static \
+                -DLLAMA_BUILD_SERVER=ON -DLLAMA_CURL=OFF
+          cmake --build llama.cpp-nvmoe/build-cuda -j"$(nproc)" \
+                --target llama-server llama-bench llama-gguf-split \
+                         llama-nvmoe-logits llama-nvmoe-trace
+
+      - name: package
+        run: |
+          mkdir -p dist/nvmoe-bin
+          cp llama.cpp-nvmoe/build-cuda/bin/{llama-server,llama-bench,llama-gguf-split,llama-nvmoe-logits,llama-nvmoe-trace} dist/nvmoe-bin/
+          tar -C dist -czf "nvmoe-bin-${GITHUB_REF_NAME}-linux-x86_64-cuda.tar.gz" nvmoe-bin
+
+      - name: fetch CPU artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: nvmoe-bin-linux-x86_64-cpu
+          path: dist-cpu/nvmoe-bin
+
+      - name: package CPU tarball
+        run: |
+          chmod +x dist-cpu/nvmoe-bin/* || true
+          tar -C dist-cpu -czf "nvmoe-bin-${GITHUB_REF_NAME}-linux-x86_64-cpu.tar.gz" nvmoe-bin
+
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "nvmoe $GITHUB_REF_NAME" \
+            --notes "Prebuilt Linux x86_64 binaries of the nvmoe llama.cpp fork (pinned base + patch series). CUDA build covers sm_80/86/89/90/120 and needs only the NVIDIA driver at runtime. Unpack next to the repo as ./bin (or set NVMOE_BIN_DIR) and run: ./nvmoe run qwen3-30b-2507 — see docs/MODELS.md." \
+            "nvmoe-bin-${GITHUB_REF_NAME}-linux-x86_64-cuda.tar.gz" \
+            "nvmoe-bin-${GITHUB_REF_NAME}-linux-x86_64-cpu.tar.gz"
