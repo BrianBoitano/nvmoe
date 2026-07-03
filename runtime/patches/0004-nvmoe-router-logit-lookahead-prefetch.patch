@@ -44,10 +44,10 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  examples/nvmoe-logits/nvmoe-logits.cpp |   7 +
  src/llama-context.cpp                  |   6 +
  src/llama-graph.cpp                    |  18 +-
- src/llama-model.cpp                    |  43 +-
+ src/llama-model.cpp                    |  47 +-
  src/llama-nvmoe.cpp                    | 611 +++++++++++++++++++++++--
  src/llama-nvmoe.h                      |  97 +++-
- 6 files changed, 724 insertions(+), 58 deletions(-)
+ 6 files changed, 728 insertions(+), 58 deletions(-)
 
 diff --git a/examples/nvmoe-logits/nvmoe-logits.cpp b/examples/nvmoe-logits/nvmoe-logits.cpp
 index 66a5d61..3a548a6 100644
@@ -114,10 +114,10 @@ index 1f67067..e96d676 100644
  
          gate_exps = llama_nvmoe_pool(lyr, LLAMA_NVMOE_GATE);
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index f5b4268..099d36b 100644
+index f5b4268..b0ee906 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -1608,6 +1608,37 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1608,6 +1608,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
          }
      }
  
@@ -136,9 +136,20 @@ index f5b4268..099d36b 100644
 +            layer_dev[il] = pimpl->dev_layer[il].dev;
 +        }
 +        nvmoe.reset(llama_nvmoe_init(ml.nvmoe_dir, ml.nvmoe_manifest, cache_bytes, layer_dev, ml.no_alloc));
++    }
 +
-+        // lookahead prefetch folds each layer's FFN norm + the next layer's
-+        // router (both loaded above) into per-layer lookahead routers
+     if (ml.no_alloc) {
+         return true;
+     }
+@@ -1619,24 +1636,30 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         }
+     }
+ 
++    // nvmoe: lookahead prefetch folds each layer's FFN norm + the next
++    // layer's router into per-layer lookahead routers. This READS weight
++    // data, so it must run after load_all_data (the pool/runtime init above
++    // must not — estimate contexts build graphs without ever loading data).
++    if (nvmoe) {
 +        std::vector<ggml_tensor *> lk_norm(n_layer_all, nullptr);
 +        std::vector<ggml_tensor *> lk_gate(n_layer_all, nullptr);
 +        std::vector<ggml_tensor *> lk_gate_b(n_layer_all, nullptr);
@@ -152,10 +163,9 @@ index f5b4268..099d36b 100644
 +        llama_nvmoe_init_lookahead(nvmoe.get(), lk_norm, lk_gate, lk_gate_b);
 +    }
 +
-     if (ml.no_alloc) {
-         return true;
-     }
-@@ -1625,18 +1656,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     if (use_mmap_buffer) {
+         for (auto & mapping : ml.mappings) {
+             pimpl->mappings.emplace_back(std::move(mapping));
          }
      }
  
